@@ -1,9 +1,23 @@
+# python
 .venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
-dist/
 build/
+dist/
 .pytest_cache/
 .ruff_cache/
 .env
+
+# javascript / expo
+node_modules/
+.expo/
+
+# model weights: never commit these, they are built by dllm/slicer.py
+shards/
+mac_shards/
+hub_shards/
+*.npz
+*.safetensors
+*.onnx
+*.pte
