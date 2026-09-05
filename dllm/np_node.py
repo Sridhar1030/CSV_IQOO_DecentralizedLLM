@@ -6,6 +6,8 @@ Holds layers [a, b) only, downloads just those shards from the hub, keeps its ow
 """
 import argparse, asyncio, hashlib, json, os, resource, struct, sys, time, traceback, urllib.request
 import numpy as np
+
+from dllm.quant import dequant
 import websockets
 
 # ---------- wire (mirror of dllm/wire.py, bf16 as uint16) ----------
@@ -49,20 +51,6 @@ def rope(x, pos, theta):
 def softmax(x):
     e = np.exp(x - x.max(-1, keepdims=True))
     return e / e.sum(-1, keepdims=True)
-
-
-def dequant(z):
-    """Weights out of a shard, whichever way the slicer wrote it. An int8 shard carries one fp32
-    scale per output row alongside each quantised tensor; numpy has no int8 matmul worth using, so
-    a numpy node spends the memory back at load time and runs fp32. The download is still a
-    quarter of the size, which is the part a phone on wifi actually feels."""
-    w = {}
-    for k in z.files:
-        if k.endswith(".scale"):
-            continue
-        s = f"{k}.scale"
-        w[k] = z[k].astype(np.float32) * z[s][:, None] if s in z.files else z[k].astype(np.float32)
-    return w
 
 
 class Layer:

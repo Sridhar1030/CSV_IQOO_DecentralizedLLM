@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+from dllm.quant import unpack4
+
 
 def load_npz(path):
     with np.load(path) as z:
@@ -13,9 +15,19 @@ def load_npz(path):
 
 
 def _q(w, key):
-    """(weight, scales) for `key`: int8 plus one fp32 scale per output row when the slicer
-    quantised this shard, fp32 and None when it did not. Both shard kinds load the same way."""
+    """(weight, scales) for `key`, whichever way the slicer wrote it.
+
+    fp32 shards give (fp32, None). int8 shards (int8, one scale per row) are used as they are.
+    int4 shards are unpacked and re-quantised to int8 here, at load: the fast kernel takes one
+    scale per row, and measuring says a row scale reproduces int4's grouped codes exactly well
+    enough that the layer error does not move. So int4 buys a smaller download and a smaller
+    file for a phone to hold, and a torch node still runs the int8 path."""
     t = w[key]
+    if t.dtype == torch.uint8:                                   # int4, two codes per byte
+        fp = torch.from_numpy(unpack4(t.numpy(), w[f"{key}.scale"].numpy()))
+        s = fp.abs().amax(1) / 127.0
+        s[s == 0] = 1.0
+        return (fp / s[:, None]).round().clamp(-127, 127).to(torch.int8), s
     if t.dtype == torch.int8:
         return t, w[f"{key}.scale"].float()
     return t.float(), None

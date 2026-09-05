@@ -11,7 +11,8 @@ import pytest
 import torch
 
 from dllm.model import Cfg, Layer, QLinear, _q
-from dllm.slicer import put, quantize
+from dllm.quant import dequant, quantize, quantize4, unpack4
+from dllm.slicer import put
 
 SHARD = next((d for d in ("dist", "mac_shards", "shards") if os.path.exists(f"{d}/layer_00.npz")), None)
 
@@ -43,8 +44,8 @@ def test_qlinear_int8_matches_dequantised_linear():
 
 def test_put_writes_scales_the_loader_finds():
     out = {}
-    put(out, "self_attn.q_proj.weight", np.random.default_rng(1).standard_normal((16, 8)), int8=True)
-    put(out, "self_attn.q_proj.bias", np.zeros(16), int8=True)          # 1D stays fp32
+    put(out, "self_attn.q_proj.weight", np.random.default_rng(1).standard_normal((16, 8)), "int8")
+    put(out, "self_attn.q_proj.bias", np.zeros(16), "int8")          # 1D stays fp32
     assert out["self_attn.q_proj.weight"].dtype == np.int8
     assert out["self_attn.q_proj.bias"].dtype == np.float32
     assert "self_attn.q_proj.bias.scale" not in out
@@ -60,7 +61,7 @@ def test_int8_layer_tracks_fp32_layer_on_real_weights():
         fp32 = {k: z[k].astype(np.float32) for k in z.files}
     q8 = {}
     for k, v in fp32.items():
-        put(q8, k, v, int8=True)
+        put(q8, k, v, "int8")
 
     t = lambda d: {k: torch.from_numpy(v) for k, v in d.items()}
     a, b = Layer(cfg, t(fp32)), Layer(cfg, t(q8))

@@ -13,6 +13,8 @@ import numpy as np
 from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors import safe_open
 
+from dllm.quant import quantize, quantize4
+
 INDEX = "model.safetensors.index.json"
 SIDECAR = ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json",
            "vocab.json", "merges.txt"]
@@ -22,21 +24,11 @@ def _np(t):
     return t.float().numpy() if t.dtype.is_floating_point else t.numpy()
 
 
-def quantize(a):
-    """Symmetric int8 with one scale per output row. Rows are output channels, so a row with a
-    small dynamic range keeps its resolution however large the rest of the matrix is."""
-    a = np.ascontiguousarray(a, dtype=np.float32)
-    s = np.abs(a).max(axis=1) / 127.0
-    s[s == 0] = 1.0                                        # an all-zero row would divide by zero
-    q = np.rint(a / s[:, None]).clip(-127, 127).astype(np.int8)
-    return q, s.astype(np.float32)
-
-
-def put(out, key, a, int8):
+def put(out, key, a, quant):
     """Store one tensor. 2D tensors are the projections, the embedding and lm_head, and are the
     only ones worth quantising; norms and biases are 1D and stay fp32."""
-    if int8 and a.ndim == 2:
-        q, s = quantize(a)
+    if quant and a.ndim == 2:
+        q, s = quantize4(a) if quant == "int4" else quantize(a)
         out[key], out[f"{key}.scale"] = q, s
     else:
         out[key] = np.ascontiguousarray(a, dtype=np.float32)
@@ -99,7 +91,7 @@ class Checkpoint:
             self.last_use.pop(f, None)
 
 
-def slice_model(repo, out, int8=False, stream=False):
+def slice_model(repo, out, quant=None, stream=False):
     os.makedirs(out, exist_ok=True)
     if stream:
         for f in SIDECAR:
@@ -135,10 +127,14 @@ def slice_model(repo, out, int8=False, stream=False):
 
     hashes = {}
     for step, (name, layer, ks) in enumerate(steps):
+        # The embedding and lm_head never go below int8. Measured on the 0.5B, taking them to int4
+        # costs more than quantising all 24 layers does (perplexity 16.1 -> 18.4), while int8 costs
+        # nothing against fp32. They are one shard the coordinator holds, so the bytes are cheap.
+        how = "int8" if layer is None and quant else quant
         w = {}
         for k in ks:
             short = k if layer is None else k.split(f"model.layers.{layer}.", 1)[1]
-            put(w, short, ck.get(k), int8)
+            put(w, short, ck.get(k), how)
         np.savez(f"{out}/{name}.npz", **w)
         if layer is not None:
             hashes[str(layer)] = content_hash(w)
@@ -147,7 +143,7 @@ def slice_model(repo, out, int8=False, stream=False):
         print(f"  {name}.npz  {os.path.getsize(f'{out}/{name}.npz')/2**20:.0f} MB", flush=True)
 
     files = {os.path.basename(p): os.path.getsize(p) for p in sorted(glob.glob(f"{out}/*.npz"))}
-    json.dump({"repo": repo, "n_layers": n_layers, "quant": "int8" if int8 else "fp32",
+    json.dump({"repo": repo, "n_layers": n_layers, "quant": quant or "fp32",
                "files": files, "layer_hashes": hashes},
               open(f"{out}/manifest.json", "w"), indent=1)
     print(f"{n_layers} layer shards + head -> {out}  ({sum(files.values())/2**30:.2f} GB total)")
@@ -157,9 +153,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("out", nargs="?", default="shards")
-    ap.add_argument("--int8", action="store_true", help="store projections as int8 with per-row scales")
+    ap.add_argument("--int8", action="store_true", help="projections as int8 with one scale per output row")
+    ap.add_argument("--int4", action="store_true",
+                    help="projections as int4, two per byte, one scale per 128 columns. Half the bytes of int8, so a phone can hold layers of a model that would not otherwise fit on one")
     ap.add_argument("--stream", action="store_true",
                     help="fetch one checkpoint file at a time and delete it once no later layer "
                          "needs it, so peak disk stays near the size of the output")
     a = ap.parse_args()
-    slice_model(a.repo, a.out, int8=a.int8, stream=a.stream)
+    slice_model(a.repo, a.out, quant="int4" if a.int4 else "int8" if a.int8 else None, stream=a.stream)
