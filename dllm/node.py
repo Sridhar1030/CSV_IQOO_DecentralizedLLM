@@ -1,6 +1,6 @@
 """Layer node. Holds layers [a, b) only. One persistent WebSocket to the hub. Never loads the full model.
 python -m dllm.node --hub ws://192.168.1.10:8000/ws/node --name mac2 --code ABC123 [--layers 16-28] [--device mps]"""
-import argparse, asyncio, hashlib, os, resource, subprocess, sys, time, urllib.request
+import argparse, asyncio, hashlib, os, resource, subprocess, sys, time, traceback, urllib.request
 import numpy as np
 import torch, websockets
 from dllm.model import Cfg, Shard
@@ -88,52 +88,139 @@ def battery():
         return None
 
 
+def disk_layers(shard_dir):
+    """Layer ids already on disk. The hub's planner counts these as free to assign here."""
+    if not os.path.isdir(shard_dir):
+        return []
+    return sorted(int(f[6:8]) for f in os.listdir(shard_dir) if f.startswith("layer_") and f.endswith(".npz"))
+
+
 def fetch_shards(http_base, shard_dir, a, b):
+    """Download whatever [a, b) still lacks. Returns (bytes downloaded, seconds), which the hub
+    turns into a bandwidth estimate; files already present cost nothing and count nothing.
+    Downloads land in a .part file first so a socket drop mid-transfer never leaves a truncated
+    shard that looks complete on the next pass."""
     os.makedirs(shard_dir, exist_ok=True)
+    total, t0 = 0, time.time()
     for f in ["config.json"] + [f"layer_{i:02d}.npz" for i in range(a, b)]:
         dst = f"{shard_dir}/{f}"
         if not os.path.exists(dst):
-            print("downloading", f)
-            urllib.request.urlretrieve(f"{http_base}/shards/{f}", dst)
+            print("downloading", f, flush=True)
+            urllib.request.urlretrieve(f"{http_base}/shards/{f}", dst + ".part")
+            os.replace(dst + ".part", dst)
+            total += os.path.getsize(dst)
+    return total, time.time() - t0
+
+
+def load_range(http_base, shard_dir, a, b, device="cpu"):
+    """Fetch, drop foreign shards, build the shard, warm it, bench it. One function for the first
+    assign and for a reassign, so both paths measure and report exactly the same things.
+    Blocking by design: run it in a thread so heartbeats keep flowing during a long download."""
+    dl_bytes, dl_s = fetch_shards(http_base, shard_dir, a, b)
+    drop_foreign_shards(shard_dir, a, b)
+    cfg = Cfg.load(f"{shard_dir}/config.json")
+    t0 = time.time()
+    shard = Shard(cfg, shard_dir, a, b, device=device)
+    # warm up + bench: one 1-token forward through own layers
+    shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_bench"); shard.reset("_bench")
+    load_s = time.time() - t0
+    t1 = time.time(); shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_bench"); shard.reset("_bench")
+    ms_per_layer = (time.time() - t1) * 1000 / (b - a)
+    print(f"layers {a}-{b-1} loaded in {load_s:.1f}s, {ms_per_layer:.2f} ms/layer/token", flush=True)
+    fields = {"layers": [a, b], "ms_per_layer": ms_per_layer, "batch": True, "reassign": True,
+              "rss_mb": rss_mb(), "shard_dir": os.path.abspath(shard_dir), "files": sorted(os.listdir(shard_dir)),
+              "fingerprints": {i: fingerprint(shard_dir, i) for i in range(a, b)},
+              "download_bytes": dl_bytes, "download_s": dl_s, "load_s": load_s}
+    return shard, cfg, fields
 
 
 async def run(args):
     http_base = args.hub.replace("ws://", "http://").replace("wss://", "https://").split("/ws/")[0]
+    shard = cfg = ready_fields = None
+    had_ready = False
+    tasks = set()
+
+    def spawn(coro):
+        # Loads and prefetches run beside the message loop, not in it: a forward that arrives while
+        # nothing is loaded must get "not loaded" back, and a prefetch must not stall serving.
+        t = asyncio.create_task(coro); tasks.add(t); t.add_done_callback(tasks.discard)
+
     async with websockets.connect(args.hub, max_size=None) as ws:
         hello = {"t": "hello", "name": args.name, "code": args.code, "device": args.device,
-                 "ram_gb": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30, 1)}
+                 "ram_gb": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30, 1),
+                 "reassign": True, "disk": disk_layers(args.shards)}
         if args.layers:
             hello["layers"] = [int(v) for v in args.layers.split("-")]
         await ws.send(pack(hello))
-        hdr, _ = unpack(await ws.recv())
-        assert hdr["t"] == "assign", hdr
-        a, b = hdr["layers"]
-        args.layers = f"{a}-{b}"   # reclaim this exact range if the connection drops and we retry
-        fetch_shards(http_base, args.shards, a, b)
-        drop_foreign_shards(args.shards, a, b)
-        cfg = Cfg.load(f"{args.shards}/config.json")
-        t0 = time.time()
-        shard = Shard(cfg, args.shards, a, b, device=args.device)
-        # warm up + bench: one 1-token forward through own layers
-        shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_bench"); shard.reset("_bench")
-        t1 = time.time(); shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_bench"); shard.reset("_bench")
-        ms_per_layer = (time.time() - t1) * 1000 / (b - a)
-        print(f"layers {a}-{b-1} loaded in {time.time()-t0:.1f}s, {ms_per_layer:.2f} ms/layer/token")
-        await ws.send(pack({"t": "ready", "layers": [a, b], "ms_per_layer": ms_per_layer, "batch": True,
-                            "rss_mb": rss_mb(), "shard_dir": os.path.abspath(args.shards),
-                            "files": sorted(os.listdir(args.shards)),
-                            "fingerprints": {i: fingerprint(args.shards, i) for i in range(a, b)}}))
 
         async def heartbeat():
             while True:
-                await ws.send(pack({"t": "hb", "battery": battery(), "cache_reqs": len(shard.cache), "rss_mb": rss_mb(),
-                                    "mem": device_stats()}))
+                await ws.send(pack({"t": "hb", "battery": battery(), "cache_reqs": len(shard.cache) if shard else 0,
+                                    "rss_mb": rss_mb(), "mem": device_stats()}))
                 await asyncio.sleep(1)
+
+        # One download or load at a time. Two loads on the same shard dir delete each other's files
+        # and race on the same .part file, and whichever finished last would own `shard` even if
+        # the hub had already committed the other range. An assign that is superseded while it
+        # waits for the lock is skipped: only the newest one is worth loading.
+        io_lock = asyncio.Lock()
+        newest = [0]
+
+        async def on_assign(hdr):
+            nonlocal shard, cfg, ready_fields, had_ready
+            a, b = hdr["layers"]
+            gen = hdr.get("gen", 0)
+            newest[0] += 1
+            mine = newest[0]
+            async with io_lock:
+                if mine != newest[0]:
+                    print(f"assign {a}-{b-1} gen {gen} superseded before it started", flush=True)
+                    return
+                if shard is not None and (shard.a, shard.b) == (a, b):
+                    # Same range, already loaded: reclaim and no-op plans cost nothing. The file
+                    # listing is re-read because a prefetch may have added files since the load.
+                    ready_fields["files"] = sorted(os.listdir(args.shards))
+                    await ws.send(pack({"t": "ready", **ready_fields, "gen": gen, "reassigned": True, "rss_mb": rss_mb()}))
+                    return
+                reassigned = had_ready
+                shard = None                       # forwards answer "not loaded" until the new range is up
+                args.layers = f"{a}-{b}"           # reclaim this exact range if the connection drops and we retry
+                try:
+                    shard, cfg, ready_fields = await asyncio.to_thread(load_range, http_base, args.shards, a, b, args.device)
+                except Exception as e:
+                    # Say so, or the hub sees a heartbeating node that never answers and waits out its deadline.
+                    traceback.print_exc()
+                    await ws.send(pack({"t": "ready", "gen": gen, "layers": [a, b], "error": f"{type(e).__name__}: {e}"}))
+                    return
+                await ws.send(pack({"t": "ready", **ready_fields, "gen": gen, "reassigned": reassigned}))
+                had_ready = True
+
+        async def on_prefetch(hdr):
+            a, b = hdr["layers"]
+            gen = hdr.get("gen", 0)
+            try:
+                async with io_lock:
+                    n, secs = await asyncio.to_thread(fetch_shards, http_base, args.shards, a, b)
+                await ws.send(pack({"t": "prefetched", "gen": gen, "layers": [a, b], "bytes": n, "s": secs}))
+            except Exception as e:
+                await ws.send(pack({"t": "prefetched", "gen": gen, "error": f"{type(e).__name__}: {e}"}))
+
         hb = asyncio.create_task(heartbeat())
         try:
             async for msg in ws:
                 hdr, payload = unpack(msg)
-                if hdr["t"] == "fwd":
+                kind = hdr["t"]
+                if kind == "assign":
+                    spawn(on_assign(hdr))
+                elif kind == "prefetch":
+                    spawn(on_prefetch(hdr))
+                elif kind == "standby":
+                    print(f"standby: {hdr.get('reason', '')}", flush=True)
+                elif kind == "error":
+                    print(f"hub refused us: {hdr}", flush=True); return
+                elif kind == "fwd":
+                    if shard is None:
+                        await ws.send(pack({"t": "fwd_out", "req": hdr["req"], "hop": hdr["hop"], "error": "not loaded"})); continue
                     n = hdr["n"]
                     dt = hdr.get("dtype", "bf16")
                     x = from_bytes(payload, (1, n, cfg.hidden), dt)
@@ -143,7 +230,9 @@ async def run(args):
                     ms = (time.time() - t) * 1000
                     await ws.send(pack({"t": "fwd_out", "req": hdr["req"], "hop": hdr["hop"], "n": n, "ms": ms, "dtype": hdr.get("out_dtype", "bf16")},
                                        to_bytes(y, hdr.get("out_dtype", "bf16"))))
-                elif hdr["t"] == "fwd_batch":
+                elif kind == "fwd_batch":
+                    if shard is None:
+                        await ws.send(pack({"t": "fwd_batch_out", "key": hdr["key"], "error": "not loaded"})); continue
                     reqs, poss = hdr["reqs"], hdr["pos"]
                     x = from_bytes(payload, (len(reqs), 1, cfg.hidden), hdr.get("dtype", "bf16"))
                     t = time.time()
@@ -152,10 +241,13 @@ async def run(args):
                     out_dt = hdr.get("out_dtype", "bf16")
                     await ws.send(pack({"t": "fwd_batch_out", "key": hdr["key"], "batch": len(reqs),
                                         "ms": ms, "dtype": out_dt}, to_bytes(y, out_dt)))
-                elif hdr["t"] == "reset":
-                    shard.reset(hdr["req"])
+                elif kind == "reset":
+                    if shard is not None:
+                        shard.reset(hdr["req"])
         finally:
             hb.cancel()
+            for t in tasks:
+                t.cancel()
 
 
 async def forever(args):

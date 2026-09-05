@@ -86,6 +86,11 @@ class CpuEngine : Engine {
 
     override fun load(dir: File, a: Int, b: Int, cfg: ModelConfig) {
         this.cfg = cfg
+        // A reassign must never serve a KV entry computed by the old layers, and the old shard's
+        // pages have to go before the new ones come in or two shards sit resident at once. The
+        // file handles closed at map time; the mappings themselves only go when the GC collects
+        // the buffers, which is the one way Android offers, so ask for a collection here.
+        cache.clear(); layers = emptyList(); loaded = emptyList(); System.gc()
         loaded = (a until b).map { Npz.load(File(dir, "layer_%02d.npz".format(it))) }
         layers = loaded.map { LayerW(it) }
     }
