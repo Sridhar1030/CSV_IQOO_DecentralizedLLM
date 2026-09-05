@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0B0D10"
+    android:fillViewport="true">
+
+<LinearLayout
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <!-- header: cluster at a glance -->
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+        <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:orientation="vertical">
+            <TextView android:id="@+id/title" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="dllm" android:textColor="#E6EDF3" android:textSize="26sp" android:textStyle="bold" />
+            <TextView android:id="@+id/pipeline" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="connecting" android:textColor="#9AA7B4" android:textSize="13sp" android:fontFamily="monospace" />
+        </LinearLayout>
+        <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="vertical" android:gravity="end">
+            <TextView android:id="@+id/tps" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="0.0" android:textColor="#7EE787" android:textSize="34sp" android:textStyle="bold" android:fontFamily="monospace" />
+            <TextView android:id="@+id/tpsLabel" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="tokens / s" android:textColor="#5B6773" android:textSize="12sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 24 layers, coloured by the device holding each one -->
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="18dp"
+        android:text="LAYERS" android:textColor="#5B6773" android:textSize="11sp" android:letterSpacing="0.15" />
+    <LinearLayout android:id="@+id/strip" android:layout_width="match_parent" android:layout_height="26dp"
+        android:layout_marginTop="6dp" android:orientation="horizontal" />
+    <LinearLayout android:id="@+id/stripLabels" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="4dp" android:orientation="horizontal" />
+
+    <!-- one card per device -->
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="18dp"
+        android:text="DEVICES" android:textColor="#5B6773" android:textSize="11sp" android:letterSpacing="0.15" />
+    <LinearLayout android:id="@+id/nodes" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="6dp" android:orientation="vertical" />
+
+    <!-- what the model is saying right now -->
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="18dp"
+        android:text="OUTPUT" android:textColor="#5B6773" android:textSize="11sp" android:letterSpacing="0.15" />
+    <TextView android:id="@+id/output" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="6dp" android:padding="12dp" android:background="#161B22" android:minHeight="64dp"
+        android:text="" android:textColor="#E6EDF3" android:textSize="15sp" android:fontFamily="monospace" />
+    <TextView android:id="@+id/tokens" android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:layout_marginTop="4dp" android:text="" android:textColor="#5B6773" android:textSize="12sp" android:fontFamily="monospace" />
+
+    <!-- this phone -->
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="18dp"
+        android:text="THIS PHONE" android:textColor="#5B6773" android:textSize="11sp" android:letterSpacing="0.15" />
+    <TextView android:id="@+id/selfStatus" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="6dp" android:text="idle" android:textColor="#E6EDF3" android:textSize="15sp" android:fontFamily="monospace" />
+    <TextView android:id="@+id/selfDetail" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="" android:textColor="#9AA7B4" android:textSize="12sp" android:fontFamily="monospace" />
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="10dp" android:orientation="horizontal">
+        <EditText android:id="@+id/hub" android:layout_width="0dp" android:layout_weight="2" android:layout_height="wrap_content"
+            android:hint="hub host:port" android:inputType="textUri" android:textSize="13sp"
+            android:textColor="#E6EDF3" android:textColorHint="#5B6773" android:backgroundTint="#30363D" />
+        <EditText android:id="@+id/code" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:layout_marginStart="8dp" android:hint="code" android:inputType="textCapCharacters" android:textSize="13sp"
+            android:textColor="#E6EDF3" android:textColorHint="#5B6773" android:backgroundTint="#30363D" />
+    </LinearLayout>
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:orientation="horizontal">
+        <Button android:id="@+id/join" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Join" />
+        <Button android:id="@+id/leave" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:layout_marginStart="8dp" android:text="Leave" />
+    </LinearLayout>
+</LinearLayout>
+</ScrollView>

@@ -17,7 +17,17 @@ node_modules/
 shards/
 mac_shards/
 hub_shards/
+tail_shards/
+mac2_shards/
 *.npz
 *.safetensors
 *.onnx
 *.pte
+
+# android build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/
+*.apk

@@ -119,7 +119,7 @@ async def run(args):
         t1 = time.time(); shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_bench"); shard.reset("_bench")
         ms_per_layer = (time.time() - t1) * 1000 / (b - a)
         print(f"layers {a}-{b-1} loaded in {time.time()-t0:.1f}s, {ms_per_layer:.2f} ms/layer/token")
-        await ws.send(pack({"t": "ready", "layers": [a, b], "ms_per_layer": ms_per_layer,
+        await ws.send(pack({"t": "ready", "layers": [a, b], "ms_per_layer": ms_per_layer, "batch": True,
                             "rss_mb": rss_mb(), "shard_dir": os.path.abspath(args.shards),
                             "files": sorted(os.listdir(args.shards)),
                             "fingerprints": {i: fingerprint(args.shards, i) for i in range(a, b)}}))
@@ -143,6 +143,15 @@ async def run(args):
                     ms = (time.time() - t) * 1000
                     await ws.send(pack({"t": "fwd_out", "req": hdr["req"], "hop": hdr["hop"], "n": n, "ms": ms, "dtype": hdr.get("out_dtype", "bf16")},
                                        to_bytes(y, hdr.get("out_dtype", "bf16"))))
+                elif hdr["t"] == "fwd_batch":
+                    reqs, poss = hdr["reqs"], hdr["pos"]
+                    x = from_bytes(payload, (len(reqs), 1, cfg.hidden), hdr.get("dtype", "bf16"))
+                    t = time.time()
+                    y = shard.forward_batch(x, poss, reqs)
+                    ms = (time.time() - t) * 1000
+                    out_dt = hdr.get("out_dtype", "bf16")
+                    await ws.send(pack({"t": "fwd_batch_out", "key": hdr["key"], "batch": len(reqs),
+                                        "ms": ms, "dtype": out_dt}, to_bytes(y, out_dt)))
                 elif hdr["t"] == "reset":
                     shard.reset(hdr["req"])
         finally:

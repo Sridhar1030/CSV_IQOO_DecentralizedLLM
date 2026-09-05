@@ -55,6 +55,23 @@ def local_only(a, prompt, n, temperature, top_p, top_k, seed):
     return tok.decode(out)
 
 
+# -------------------------------------------------------------------------------------------------
+# concurrency: the cluster serves several requests at once without mixing them up
+# -------------------------------------------------------------------------------------------------
+def test_concurrent_requests_do_not_share_state(hub="http://127.0.0.1:8000"):
+    """Each node keys its KV cache by request id, so two requests in flight must not touch each
+    other. Greedy decoding makes any leak deterministic and visible: the text would drift."""
+    from concurrent.futures import ThreadPoolExecutor
+    prompts = ["Name one car.", "Name one fruit.", "What is the capital of Japan?"]
+    ask = lambda p: post(hub, {"messages": [{"role": "user", "content": p}], "max_tokens": 12})
+    alone = {p: ask(p) for p in prompts}
+    with ThreadPoolExecutor(len(prompts)) as ex:
+        together = dict(zip(prompts, ex.map(ask, prompts)))
+    for p in prompts:
+        assert together[p] == alone[p], f"{p!r}: {together[p]!r} concurrently vs {alone[p]!r} alone"
+    return alone
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--prompt", default="Name one fruit.")
@@ -103,6 +120,14 @@ def main():
     printable = sum(c.isascii() and (c.isalnum() or c in " .,'!?-\n") for c in both) / max(len(both), 1)
     check("the full pipeline produces coherent text",
           printable > 0.9, f"{printable:.0%} of the answer is ordinary text")
+
+    print("\n5. Several requests at once must not contaminate each other")
+    try:
+        answers = test_concurrent_requests_do_not_share_state(a.hub)
+        check("concurrent requests give the same answers as one at a time", True,
+              f"{len(answers)} prompts, identical served alone and together")
+    except AssertionError as e:
+        check("concurrent requests give the same answers as one at a time", False, str(e)[:120])
 
     if a.temperature == 0:
         again = post(a.hub, {"messages": [{"role": "user", "content": a.prompt}],

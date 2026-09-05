@@ -21,6 +21,7 @@ it by hand.
 | `dllm/prove.py` | Adversarial checks that the split is real. Severs a node and expects failure. |
 | `dllm/test_split.py`, `decisive.py` | The laptop alone versus the laptop plus phones, same prompt. |
 | `observability/` | OTLP proxy + Collector + Jaeger + Prometheus. See its README. |
+| `android/` | The phone app: a node with a swappable runtime. Joins from the QR with no typing. |
 | `BUILD-PLAN.md` | The four-device plan, cut line, and what was deliberately not built. |
 | `how_torun_on_npu.md` | Hexagon NPU bring-up on the iQOO: what runs, what fails, and the exact library pairing. |
 
@@ -56,6 +57,64 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 ```
 
 `temperature`, `top_p`, `top_k`, `seed` and `stream` behave as an OpenAI client expects.
+
+## The phone app
+
+`android/` is a native Android node. Scan the QR, tap **Get the app**, allow the install once, tap
+**Open in the dllm node app**, and the phone joins with no typing. It downloads only its assigned
+layers, hashes them against the manifest, runs them, and stays up with the screen off.
+
+Its screen is a dashboard for the whole cluster, fed by the hub's `/status` and `/events`: a strip of
+all 24 layers coloured by the device holding each, a card per device showing what it is doing this
+instant (prefill, decode, idle, gone) with its last and average hop time, wire time, hop count,
+battery, RAM and CPU as that device reports them, tokens per second, and the answer streaming in.
+Cards flash as each hop lands, so a row of phones lights up in order as a token travels through them.
+
+Build it once on the Mac (JDK 17 and the Android SDK, both via Homebrew):
+
+```bash
+cd android && JAVA_HOME=/opt/homebrew/opt/openjdk@17 ANDROID_HOME=~/Library/Android/sdk ./gradlew assembleDebug
+```
+
+The hub serves the result at `/app.apk` and offers it on the join page automatically.
+
+The runtime is one interface, `Engine` in `android/app/src/main/java/dev/dllm/node/Engine.kt`, and
+one line in `Engines` picks the implementation. The shipped one is pure Kotlin fp32 on every core,
+with weights memory-mapped straight out of the `.npz` shards so a 500 MB slice costs no Java heap.
+It matches the numpy and torch nodes to rounding. It is the reference runtime, not the fast one:
+decode is bound by moving fp32 weights, and a quantised engine behind the same interface is the
+upgrade. Measured on a Snapdragon 8 Elite, 8 layers of Qwen2.5-0.5B, decode 47 ms per token,
+prefill of 35 tokens 790 ms.
+
+## Throughput
+
+Requests run concurrently, and decode steps waiting on the same node are merged into one frame.
+A decode step reads every weight in a node's shard to produce a single token, half an operation of
+arithmetic per byte moved, so serving one request at a time throws nearly all of that away.
+Batching pays for the weight read once and gets B tokens out of it.
+
+Measured on a Mac and two phones, eight concurrent requests:
+
+| | time | tokens/s |
+|---|---|---|
+| one at a time | 39.5 s | 2.20 |
+| all at once | 13.0 s | 6.69 |
+
+That is 3.04x, with every answer identical to serving it alone. The gain is lopsided by device,
+because batching only helps a runtime that is starved for memory bandwidth rather than for compute:
+
+| device | batch 1 | batch 4 | gain |
+|---|---|---|---|
+| Mac, torch and BLAS | 20.9 ms/request | 9.8 ms | 2.1x |
+| phone, scalar Kotlin | 46.8 ms/request | 41.1 ms | 1.14x |
+
+So most of the 3.04x is pipelining, not batching, and the phone runtime is the ceiling. A quantised
+or SIMD engine behind the same `Engine` interface would raise both its own speed and the value of
+batching. `BATCH_WINDOW_S` in `dllm/hub.py` is the whole scheduler: it collects whoever is waiting
+on a node for a few milliseconds, far below the tens of milliseconds a hop costs.
+
+Nodes advertise `batch` when they support it and the hub falls back to sequential unless every node
+in the pipeline does, so a cluster running mixed app versions stays correct.
 
 ## Verify it
 

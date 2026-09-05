@@ -107,6 +107,46 @@ class Layer(torch.nn.Module):
         x = x + F.linear(F.silu(F.linear(h, self.wg)) * F.linear(h, self.wu), self.wd)
         return x, k, v
 
+    def forward_batch(self, x, positions, past):
+        """One decode step for several independent requests at once.
+
+        x: (B, 1, hidden), one row per request. positions: (B,) absolute position of each row.
+        past: list of B (k, v) pairs or None, each that request's own cache.
+
+        Why this is worth doing: every matmul below reads the same weights whichever B is used, and
+        at B=1 a decode step reads 57 MB of weights to do 30 MFLOP of arithmetic. Batching pays for
+        that traffic once and gets B times the work out of it. Attention is the exception, because
+        each row attends over a different history, so it is looped. Attention is a small share of
+        both the weights and the time, so the loop costs little.
+        """
+        c = self.cfg
+        B = x.shape[0]
+        h = rms_norm(x, self.ln1, c.eps)                                   # (B, 1, H)
+        q = F.linear(h, self.wq, self.bq).view(B, 1, c.heads, c.head_dim).transpose(1, 2)
+        k = F.linear(h, self.wk, self.bk).view(B, 1, c.kv_heads, c.head_dim).transpose(1, 2)
+        v = F.linear(h, self.wv, self.bv).view(B, 1, c.kv_heads, c.head_dim).transpose(1, 2)
+
+        rep_ = c.heads // c.kv_heads
+        out = x.new_empty(B, 1, c.hidden)
+        new_cache = []
+        for i in range(B):
+            pos_i = positions[i:i + 1]                                      # (1,)
+            qi = rope(q[i:i + 1], pos_i, c.theta)
+            ki = rope(k[i:i + 1], pos_i, c.theta)
+            vi = v[i:i + 1]
+            if past is not None and past[i] is not None:
+                pk, pv = past[i]
+                ki, vi = torch.cat([pk, ki], 2), torch.cat([pv, vi], 2)
+            new_cache.append((ki, vi))
+            att = (qi @ ki.repeat_interleave(rep_, 1).transpose(-1, -2)) / math.sqrt(c.head_dim)
+            att = att.softmax(-1)                                           # one query, all keys: no mask needed
+            out[i] = (att @ vi.repeat_interleave(rep_, 1)).transpose(1, 2).reshape(1, 1, c.hidden)
+
+        x = x + F.linear(out, self.wo)
+        h = rms_norm(x, self.ln2, c.eps)
+        x = x + F.linear(F.silu(F.linear(h, self.wg)) * F.linear(h, self.wu), self.wd)
+        return x, new_cache
+
 
 class Shard(torch.nn.Module):
     """Contiguous layer range [a, b). Holds its own KV cache per request id."""
@@ -130,6 +170,22 @@ class Shard(torch.nn.Module):
             x, k, v = layer(x, pos, pk, pv)
             new.append((k, v))
         self.cache[req] = new
+        return x
+
+    @torch.no_grad()
+    def forward_batch(self, x, positions, reqs):
+        """x: (B, 1, hidden), one row per request id in `reqs`, each at its own position."""
+        x = x.to(self.device_)
+        positions = torch.as_tensor(positions, device=self.device_)
+        caches = [self.cache.get(r) for r in reqs]
+        for li, layer in enumerate(self.layers):
+            past = [c[li] if c else None for c in caches]
+            x, new = layer.forward_batch(x, positions, past)
+            for bi, r in enumerate(reqs):
+                if caches[bi] is None:
+                    caches[bi] = [None] * len(self.layers)
+                    self.cache[r] = caches[bi]
+                caches[bi][li] = new[bi]
         return x
 
     def reset(self, req):

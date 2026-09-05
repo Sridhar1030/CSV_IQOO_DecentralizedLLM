@@ -106,6 +106,46 @@ class Shard:
         self.cache[req] = new
         return x
 
+    def forward_batch(self, x, positions, reqs):
+        """One decode step for several requests at once: x is (B, 1, hidden), one row each.
+
+        The projections and the feedforward run over all rows in a single matmul, so the weights are
+        read once for the whole batch. That is the entire point: a decode step is bound by moving
+        weights, not by arithmetic. Attention is per row, because each request has its own history.
+        """
+        c = self.cfg
+        B = x.shape[0]
+        cached = [self.cache.get(r) for r in reqs]
+        for li, layer in enumerate(self.layers):
+            h = rms_norm(x, layer.ln1, c["rms_norm_eps"])
+            H, KV, D = c["heads"], c["kv_heads"], c["head_dim"]
+            q = (h @ layer.wq + layer.bq).reshape(B, 1, H, D).transpose(0, 2, 1, 3)
+            k = (h @ layer.wk + layer.bk).reshape(B, 1, KV, D).transpose(0, 2, 1, 3)
+            v = (h @ layer.wv + layer.bv).reshape(B, 1, KV, D).transpose(0, 2, 1, 3)
+            rep_ = H // KV
+            out = np.empty((B, 1, c["hidden"]), np.float32)
+            for i in range(B):
+                p = np.array([positions[i]])
+                qi = rope(q[i:i + 1], p, c["rope_theta"])
+                ki = rope(k[i:i + 1], p, c["rope_theta"])
+                vi = v[i:i + 1]
+                prev = cached[i][li] if cached[i] is not None and cached[i][li] is not None else None
+                if prev is not None:
+                    ki = np.concatenate([prev[0], ki], 2)
+                    vi = np.concatenate([prev[1], vi], 2)
+                if cached[i] is None:
+                    cached[i] = [None] * len(self.layers)
+                    self.cache[reqs[i]] = cached[i]
+                cached[i][li] = (ki, vi)
+                att = (qi @ np.repeat(ki, rep_, 1).transpose(0, 1, 3, 2)) * np.float32(1.0 / np.sqrt(D))
+                att = softmax(att)                      # one query against all keys: nothing to mask
+                out[i] = (att @ np.repeat(vi, rep_, 1)).transpose(0, 2, 1, 3).reshape(1, 1, c["hidden"])
+            x = x + out @ layer.wo
+            h = rms_norm(x, layer.ln2, c["rms_norm_eps"])
+            g = h @ layer.wg
+            x = x + ((g / (np.float32(1.0) + np.exp(-g))) * (h @ layer.wu)) @ layer.wd
+        return x
+
     def reset(self, req):
         self.cache.pop(req, None)
 
@@ -237,7 +277,7 @@ async def run(args):
         t1 = time.time(); shard(z, np.array([0]), "_b"); shard.reset("_b")
         ms = (time.time() - t1) * 1000 / (b - a)
         print(f"layers {a}-{b-1} loaded in {time.time()-t0:.1f}s, {ms:.2f} ms/layer/token", flush=True)
-        await ws.send(pack({"t": "ready", "layers": [a, b], "ms_per_layer": ms,
+        await ws.send(pack({"t": "ready", "layers": [a, b], "ms_per_layer": ms, "batch": True,
                             "rss_mb": rss_mb(), "shard_dir": os.path.abspath(args.shards),
                             "files": sorted(os.listdir(args.shards)),
                             "fingerprints": {i: fingerprint(args.shards, i) for i in range(a, b)}}))
@@ -261,6 +301,16 @@ async def run(args):
                     print(f"  fwd req={hdr['req']} n={n} pos={hdr['pos']} {dt:.0f} ms", flush=True)
                     await ws.send(pack({"t": "fwd_out", "req": hdr["req"], "hop": hdr["hop"], "n": n, "ms": dt, "dtype": hdr.get("out_dtype", "bf16")},
                                        to_wire(y, hdr.get("out_dtype", "bf16"))))
+                elif hdr["t"] == "fwd_batch":
+                    reqs, poss = hdr["reqs"], hdr["pos"]
+                    x = from_wire(payload, (len(reqs), 1, cfg["hidden"]), hdr.get("dtype", "bf16"))
+                    t = time.time()
+                    y = shard.forward_batch(x, poss, reqs)
+                    dt = (time.time() - t) * 1000
+                    print(f"  batch of {len(reqs)} {dt:.0f} ms", flush=True)
+                    out_dt = hdr.get("out_dtype", "bf16")
+                    await ws.send(pack({"t": "fwd_batch_out", "key": hdr["key"], "batch": len(reqs),
+                                        "ms": dt, "dtype": out_dt}, to_wire(y, out_dt)))
                 elif hdr["t"] == "reset":
                     shard.reset(hdr["req"])
         finally:

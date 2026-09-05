@@ -1,5 +1,6 @@
 """Coordinator: lobby + hub + embed/lm_head/sampling + OpenAI endpoint + shard server.
 python -m dllm.hub --shards shards --expected 4 --port 8000"""
+import contextlib
 import argparse, asyncio, json, math, os, random, socket, string, time, uuid
 import torch
 from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request
@@ -23,6 +24,9 @@ ap.add_argument("--otlp", default=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
                 help="OTLP/HTTP endpoint for traces and metrics, normally the llmobs proxy "
                      "(http://localhost:8100). Unset disables telemetry entirely.")
 ap.add_argument("--node-id", default=None, help="This coordinator's identity in telemetry. Default: hostname.")
+ap.add_argument("--apk", default=os.path.join(os.path.dirname(__file__), "..", "android", "app", "build",
+                                              "outputs", "apk", "debug", "app-debug.apk"),
+                help="Android node app to offer on the join page, if the file exists.")
 ARGS, _ = ap.parse_known_args()
 
 app = FastAPI(title="dllm hub")
@@ -38,7 +42,11 @@ MODEL_NAME = (json.load(open(f"{ARGS.shards}/manifest.json")).get("repo", "dllm"
 nodes = {}          # name -> dict(ws, layers, ready, ms_per_layer, battery, mem, last_hb)
 pending = {}        # (req, hop) -> Future
 events = []         # list of asyncio.Queue for /events SSE listeners
-gen_lock = asyncio.Lock()   # ponytail: one request at a time; batching is ADR-006, later
+# Requests run concurrently. Every node already keys its KV cache by request id, and forward_all
+# keys its pending futures by (request, hop), so two requests interleave on the wire without
+# touching each other's state. The lock this replaces cost most of the cluster's throughput:
+# with three devices, a serialised request leaves two of them idle at all times.
+gen_lock = contextlib.nullcontext()
 
 
 def emit(ev):
@@ -48,6 +56,7 @@ def emit(ev):
 
 
 HB_TIMEOUT = 5.0  # a node that has not sent a heartbeat this recently is treated as gone
+STALE_S = 30.0    # after this long silent, a node's layer range may be given to a newcomer
 
 
 def live(n):
@@ -107,10 +116,29 @@ def assign_layers(name, hello):
         return hello["layers"]
     if name in assigned:
         return assigned[name]
-    taken = sorted(assigned.values())
-    start = taken[-1][1] if taken else 0
-    chunk = math.ceil(cfg.n_layers / ARGS.expected)
-    return [start, min(start + chunk, cfg.n_layers)]
+    held = set()
+    for a, b in assigned.values():
+        held |= set(range(a, b))
+    free = [i for i in range(cfg.n_layers) if i not in held]
+    if not free:
+        # Every layer is spoken for, but some of it may belong to a node that has gone. A range
+        # stays reserved through a brief reconnect; after this long without a heartbeat it is
+        # released to whoever is joining now, which is how a replacement phone takes over.
+        stale = [n for n in assigned if n not in nodes or time.time() - nodes[n]["last_hb"] > STALE_S]
+        if not stale:
+            return None
+        gone = max(stale, key=lambda n: time.time() - nodes[n]["last_hb"] if n in nodes else 1e9)
+        rng = assigned.pop(gone)
+        nodes.pop(gone, None)
+        print(f"  released layers {rng[0]}-{rng[1]-1} from {gone}, absent for over {STALE_S}s, to {name}")
+        return rng
+    start = free[0]                                        # the first gap, wherever it is
+    end = start
+    while end < cfg.n_layers and end in set(free):
+        end += 1
+    still_expected = max(1, ARGS.expected - len(assigned))
+    chunk = math.ceil((end - start) / still_expected)
+    return [start, min(start + chunk, end)]
 
 
 @app.websocket("/ws/node")
@@ -121,6 +149,9 @@ async def ws_node(ws: WebSocket):
         await ws.send_bytes(pack({"t": "error", "msg": "bad lobby code"})); await ws.close(); return
     name = hdr["name"]
     layers = assign_layers(name, hdr)
+    if layers is None:
+        await ws.send_bytes(pack({"t": "error", "reason": "every layer is already assigned; nothing left for you"}))
+        await ws.close(); return
     assigned[name] = layers
     nodes[name] = {"ws": ws, "layers": layers, "ready": False, "ms_per_layer": None, "battery": None,
                    "device": hdr.get("device"), "ram_gb": hdr.get("ram_gb"), "last_hb": time.time()}
@@ -132,7 +163,7 @@ async def ws_node(ws: WebSocket):
             t = hdr["t"]
             if t == "ready":
                 assigned[name] = hdr["layers"]
-                nodes[name].update(ready=True, layers=hdr["layers"], ms_per_layer=hdr["ms_per_layer"],
+                nodes[name].update(batch=bool(hdr.get("batch")), ready=True, layers=hdr["layers"], ms_per_layer=hdr["ms_per_layer"],
                                    rss_mb=hdr.get("rss_mb"), shard_dir=hdr.get("shard_dir"),
                                    files=hdr.get("files", []), fingerprints=hdr.get("fingerprints", {}))
                 emit({"t": "ready", "node": name, "layers": hdr["layers"], "ms_per_layer": hdr["ms_per_layer"]})
@@ -140,6 +171,10 @@ async def ws_node(ws: WebSocket):
                 nodes[name].update(battery=hdr.get("battery"), last_hb=time.time(),
                                    rss_mb=hdr.get("rss_mb", nodes[name].get("rss_mb")),
                                    mem=hdr.get("mem", nodes[name].get("mem")))
+            elif t == "fwd_batch_out":
+                fut = pending.pop(hdr["key"], None)
+                if fut and not fut.done():
+                    fut.set_result((hdr, payload))
             elif t == "fwd_out":
                 fut = pending.pop((hdr["req"], hdr["hop"]), None)
                 if fut and not fut.done():
@@ -147,11 +182,94 @@ async def ws_node(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        nodes.pop(name, None)
+        n = nodes.pop(name, None)
+        if n is not None:
+            print(f"  node {name} left (layers {n['layers'][0]}-{n['layers'][1]-1}, ready={n['ready']}) at {time.strftime('%H:%M:%S')}", flush=True)
         emit({"t": "leave", "node": name})
         for k, f in list(pending.items()):
             if not f.done():
                 f.set_exception(RuntimeError(f"node {name} left"))
+
+
+# --- batching -------------------------------------------------------------------------------------
+# A decode step reads every weight in a node's shard in order to produce one token, which is half an
+# operation of arithmetic per byte moved. Serving one request at a time throws almost all of that
+# away. So decode steps waiting on the same node are merged into one frame and the node reads its
+# weights once for the whole batch. Prefill is left alone: it already has many tokens to amortise.
+#
+# The wait below is the entire scheduler. Zero would batch nothing, because requests that could have
+# merged have not arrived yet. Too long and every request pays the delay. A few milliseconds is well
+# under the tens of milliseconds a hop costs, so it is invisible to one request but long enough for
+# concurrent ones to find each other.
+BATCH_WINDOW_S = 0.004
+MAX_BATCH = 16
+
+_batch_pending = {}   # node name -> list of (req, pos, x_row, future)
+_batch_task = {}      # node name -> asyncio.Task
+
+
+async def _batch_runner(name):
+    """Collect decode rows for one node, send them as one frame, hand each row back to its request."""
+    await asyncio.sleep(BATCH_WINDOW_S)
+    queued = _batch_pending.get(name, [])
+    items, _batch_pending[name] = queued[:MAX_BATCH], queued[MAX_BATCH:]
+    _batch_task.pop(name, None)
+    if _batch_pending.get(name):
+        _batch_task[name] = asyncio.ensure_future(_batch_runner(name))
+    if not items:
+        return
+    node = nodes.get(name)
+    if node is None or not live(node):
+        for *_, fut in items:
+            if not fut.done():
+                fut.set_exception(RuntimeError(f"node {name} left"))
+        return
+    reqs = [r for r, _, _, _ in items]
+    poss = [p for _, p, _, _ in items]
+    x = torch.cat([row for _, _, row, _ in items], 0)              # (B, 1, hidden)
+    key = f"{name}:{_batch_seq()}"
+    fut = asyncio.get_event_loop().create_future()
+    pending[key] = fut
+    hop, last = node["hop"], node["last_hop"]
+    out_dt = "fp32" if hop == last else "bf16"
+    t = time.time()
+    try:
+        await node["ws"].send_bytes(pack({"t": "fwd_batch", "key": key, "hop": hop,
+                                          "reqs": reqs, "pos": poss,
+                                          "dtype": "bf16", "out_dtype": out_dt}, to_bytes(x, "bf16")))
+        hdr, payload = await asyncio.wait_for(fut, timeout=120)
+    except BaseException as e:
+        pending.pop(key, None)
+        err = e if isinstance(e, Exception) else RuntimeError(str(e))
+        for *_, f in items:
+            if not f.done():
+                f.set_exception(err)
+        return
+    y = from_bytes(payload, (len(items), 1, cfg.hidden), hdr.get("dtype", out_dt))
+    ms, wire_ms = hdr["ms"], (time.time() - t) * 1000 - hdr["ms"]
+    emit({"t": "hop", "req": reqs[0], "hop": hop, "node": name, "layers": node["layers"],
+          "n": 1, "batch": len(items), "compute_ms": ms, "wire_ms": wire_ms})
+    for i, (*_, f) in enumerate(items):
+        if not f.done():
+            f.set_result((y[i:i + 1], ms, wire_ms, len(items)))
+
+
+_seq = 0
+
+
+def _batch_seq():
+    global _seq
+    _seq += 1
+    return _seq
+
+
+async def _batched_hop(name, req, x, pos):
+    """Queue one decode row for `name` and wait for that row's answer."""
+    fut = asyncio.get_event_loop().create_future()
+    _batch_pending.setdefault(name, []).append((req, pos, x, fut))
+    if name not in _batch_task:
+        _batch_task[name] = asyncio.ensure_future(_batch_runner(name))
+    return await fut
 
 
 async def forward_all(req, x, pos, trace=None):
@@ -160,6 +278,20 @@ async def forward_all(req, x, pos, trace=None):
     if not pipe:
         raise RuntimeError(f"pipeline incomplete: {[ (n['layers']) for n in nodes.values() ]}")
     n = x.shape[1]
+    # Batch only if every node advertised it. A node from an older build ignores an unknown frame
+    # and simply never answers, so one stale phone would hang the whole cluster. Falling back keeps
+    # a mixed-version cluster correct, just without the throughput gain.
+    if n == 1 and all(node.get("batch") for node in pipe):
+        for hop, node in enumerate(pipe):
+            name = next(k for k, v in nodes.items() if v is node)
+            node["hop"], node["last_hop"] = hop, len(pipe) - 1
+            t = time.time()
+            x, ms, wire_ms, _ = await _batched_hop(name, req, x, pos)
+            if trace:
+                trace.hop(index=hop, name=name, node=node, n=1, pos=pos, started=t, ended=time.time(),
+                          compute_ms=ms, wire_ms=wire_ms)
+        return x
+
     dt = "bf16"
     for hop, node in enumerate(pipe):
         # the tail node's output feeds the lm_head, so it comes back in fp32
@@ -183,11 +315,19 @@ async def forward_all(req, x, pos, trace=None):
     return x
 
 
+# Prefill is sent in pieces. One message carrying hundreds of positions keeps a phone busy for tens
+# of seconds, during which it cannot answer a ping and the hub drops it. Chunking changes no maths:
+# each chunk extends the same KV cache at the next position.
+PREFILL_CHUNK = 48
+
+
 async def generate(ids, max_tokens=256, temperature=0.0, top_p=1.0, top_k=0, seed=None, trace=None):
     req = uuid.uuid4().hex[:8]
     pipe = pipeline()
     try:
-        x = await forward_all(req, head.embed_tokens(ids), 0, trace)
+        for i in range(0, len(ids), PREFILL_CHUNK):
+            chunk = ids[i:i + PREFILL_CHUNK]
+            x = await forward_all(req, head.embed_tokens(chunk), i, trace)
         pos = len(ids)
         for _ in range(max_tokens):
             lg = head.logits(x)
@@ -196,7 +336,7 @@ async def generate(ids, max_tokens=256, temperature=0.0, top_p=1.0, top_k=0, see
                 break
             if trace:
                 trace.first_token()
-            emit({"t": "token", "req": req, "id": nxt, "pos": pos})
+            emit({"t": "token", "req": req, "id": nxt, "pos": pos, "text": tok.decode([nxt])})
             yield nxt
             x = await forward_all(req, head.embed_tokens([nxt]), pos, trace)
             pos += 1
@@ -235,7 +375,7 @@ async def chat(request: Request):
     async def run_stream():
         n = 0
         try:
-            async with gen_lock:
+            with gen_lock:
                 async for t in generate(ids, max_tokens, temp, top_p, top_k, seed, trace):
                     n += 1
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "dllm",
@@ -253,7 +393,7 @@ async def chat(request: Request):
         return StreamingResponse(run_stream(), media_type="text/event-stream")
     out = []
     try:
-        async with gen_lock:
+        with gen_lock:
             async for t in generate(ids, max_tokens, temp, top_p, top_k, seed, trace):
                 out.append(t)
     except BaseException as e:
@@ -321,11 +461,14 @@ def join(code: str, request: Request):
     if code.strip().upper() != ARGS.code.upper():
         msg = f"dllm: wrong lobby code '{code}'. This cluster's code is {ARGS.code}. Try: curl -s {join_url(host)} | sh"
         return HTMLResponse(f"<pre>{msg}</pre>", status_code=404) if wants_html else sh_error(msg)
-    name = f"node{len(assigned) + 1}"
+    name = next(f"node{i}" for i in range(1, 1000) if f"node{i}" not in assigned)   # never reuse a live name
     if not wants_html:
         return PlainTextResponse(setup_sh(name=name, host=host), media_type="text/plain")
-    taken = sorted(assigned.values())
-    start = taken[-1][1] if taken else 0
+    held = sum(b - a for a, b in assigned.values())
+    apk_link = (f'<p><a href="/app.apk" style="display:block;text-align:center;border:1px solid #30363d;color:#e6edf3;'
+                f'text-decoration:none;padding:12px;border-radius:8px">Get the app ({os.path.getsize(ARGS.apk) // 1048576} MB)</a>'
+                f'<br><span style="color:#5b6773;font-size:13px">Android asks you to allow installs from this source. Say yes once.</span></p>'
+                if os.path.exists(ARGS.apk) else '<p style="color:#5b6773">App not built yet on this coordinator.</p>')
     return HTMLResponse(f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Join the cluster</title>
 <style>body{{font:16px/1.55 system-ui;margin:0;padding:24px;background:#0b0d10;color:#e6edf3}}
@@ -335,12 +478,20 @@ font:14px/1.5 ui-monospace,monospace;color:#7ee787;word-break:break-all;user-sel
 b{{color:#e6edf3}}ol{{padding-left:20px;color:#9aa7b4}}li{{margin:10px 0}}</style>
 <h1>Join as <b>{name}</b></h1>
 <p>Lobby <b>{ARGS.code}</b> &middot; {len(assigned)} node(s) already in &middot;
-{cfg.n_layers - start} of {cfg.n_layers} layers still unassigned</p>
-<ol><li>Press and hold the command below, copy it.</li>
-<li>Open <b>Termux</b>, paste, press enter.</li></ol>
+{cfg.n_layers - held} of {cfg.n_layers} layers still unassigned</p>
+<p style="margin-top:22px"><a href="dllm://join?hub={host}&amp;code={ARGS.code}" style="display:block;text-align:center;
+background:#1f6feb;color:#fff;text-decoration:none;padding:14px;border-radius:8px;font-weight:600">Open in the dllm node app</a></p>
+{apk_link}
+<p style="margin-top:22px;color:#5b6773">Developer route, Termux:</p>
 <code>curl -s {join_url(host)} | sh</code>
-<p>Joined once already? Use your browser's Share button and pick Termux instead.</p>
 """)
+
+
+@app.get("/app.apk")
+def app_apk():
+    if not os.path.exists(ARGS.apk):
+        return PlainTextResponse("no APK built on this coordinator\n", status_code=404)
+    return FileResponse(ARGS.apk, media_type="application/vnd.android.package-archive", filename="dllm-node.apk")
 
 
 @app.get("/qr.svg")
