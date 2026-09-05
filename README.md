@@ -22,6 +22,7 @@ it by hand.
 | `dllm/test_split.py`, `decisive.py` | The laptop alone versus the laptop plus phones, same prompt. |
 | `observability/` | OTLP proxy + Collector + Jaeger + Prometheus. See its README. |
 | `BUILD-PLAN.md` | The four-device plan, cut line, and what was deliberately not built. |
+| `how_torun_on_npu.md` | Hexagon NPU bring-up on the iQOO: what runs, what fails, and the exact library pairing. |
 
 ## Run it
 
