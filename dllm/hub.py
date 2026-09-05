@@ -3,7 +3,7 @@ python -m dllm.hub --shards shards --expected 4 --port 8000"""
 import argparse, asyncio, json, math, os, random, string, time, uuid
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse, PlainTextResponse
 from transformers import AutoTokenizer
 from dllm.model import Cfg, Head
 from dllm.wire import pack, unpack, to_bf16_bytes, from_bf16_bytes
@@ -168,6 +168,23 @@ def models():
 @app.get("/shards/{name}")
 def shard_file(name: str):
     return FileResponse(f"{ARGS.shards}/{os.path.basename(name)}")
+
+
+@app.get("/s", response_class=PlainTextResponse)
+@app.get("/setup.sh", response_class=PlainTextResponse)
+def setup_sh(layers: str = "", name: str = "phoneA"):
+    """Phone bootstrap. In Termux:  pkg i -y curl && curl -s 127.0.0.1:8000/setup.sh | bash"""
+    return f"""set -e
+echo '== installing python + numpy (prebuilt, not pip) =='
+pkg update -y >/dev/null 2>&1 || true
+pkg install -y python python-numpy
+python -c 'import numpy' || {{ echo 'numpy missing'; exit 1; }}
+pip install --quiet websockets
+echo '== fetching node source =='
+curl -sO http://127.0.0.1:{ARGS.port}/node.py
+echo '== joining cluster as {name} =='
+exec python node.py --hub ws://127.0.0.1:{ARGS.port}/ws/node --code {ARGS.code} --name {name} {'--layers ' + layers if layers else ''}
+"""
 
 
 @app.get("/node.py")
