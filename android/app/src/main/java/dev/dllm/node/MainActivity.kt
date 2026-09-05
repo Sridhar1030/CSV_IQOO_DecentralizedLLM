@@ -109,7 +109,13 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        NodeState.listener = { s, d -> ui.post { selfStatus.text = s; selfDetail.text = "$d\nruntime ${NodeState.engine.ifEmpty { "cpu-fp32" }}   name ${nodeName()}" } }
+        val st = Stats(this)
+        NodeState.listener = { s, d -> ui.post {
+            selfStatus.text = s
+            val nsp = st.nspTempC()
+            val npuLine = if (nsp != null) "NPU ${nsp}°C  ${if (s == "forward" || s == "ready") "active" else "idle"}" else ""
+            selfDetail.text = "$d\nruntime ${NodeState.engine.ifEmpty { "cpu-fp32" }}   name ${nodeName()}${if (npuLine.isNotEmpty()) "\n$npuLine" else ""}"
+        } }
         selfStatus.text = NodeState.status; selfDetail.text = NodeState.detail
         val h = hub.text.toString().trim()
         if (h.isNotEmpty()) watch(h)
@@ -186,6 +192,7 @@ class MainActivity : Activity() {
             n.cpuPercent?.let { if (!it.isNaN()) bits.add("cpu %.0f%%".format(it)) }
             n.rssMb?.let { if (!it.isNaN() && it > 0) bits.add("%.0f MB".format(it)) }
             n.thermal?.let { if (it > 0) bits.add("thermal $it") }
+            n.nspTempC?.let { bits.add("NPU %.1f°C".format(it)) }
             card.res.text = bits.joinToString("   ")
         }
         for (k in cards.keys.toList()) if (k !in seen) { nodesBox.removeView(cards[k]!!.root); cards.remove(k) }

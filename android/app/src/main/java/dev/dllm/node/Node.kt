@@ -115,7 +115,7 @@ class Node(
                 shardDir.mkdirs()
                 val tf = System.nanoTime()
                 var dl = fetch("config.json")
-                for (i in a until b) dl += fetch(layerFile(i), "file ${i - a + 1} of ${b - a}  (layers $a-${b - 1})")
+                dl += fetchParallel(a, b, "layers $a-${b - 1}")
                 val downloadS = (System.nanoTime() - tf) / 1e9
                 dropForeign(a, b)
                 val c = ModelConfig(JSONObject(File(shardDir, "config.json").readText()))
@@ -152,7 +152,7 @@ class Node(
                         shardDir.mkdirs()
                         val tf = System.nanoTime()
                         var dl = fetch("config.json")
-                        for (i in a until b) dl += fetch(layerFile(i), "prefetch ${i - a + 1} of ${b - a}  (layers $a-${b - 1})")
+                        dl += fetchParallel(a, b, "prefetch $a-${b - 1}")
                         ws.send(Wire.pack(JSONObject().put("t", "prefetched").put("gen", gen)
                             .put("layers", JSONArray(listOf(a, b))).put("bytes", dl)
                             .put("s", (System.nanoTime() - tf) / 1e9)).toByteString())
@@ -217,6 +217,7 @@ class Node(
                 while (running && !Thread.currentThread().isInterrupted) {
                     val hb = JSONObject().put("t", "hb").put("battery", stats.battery() ?: JSONObject.NULL)
                         .put("thermal", stats.thermal() ?: JSONObject.NULL)
+                        .put("nsp_temp_c", stats.nspTempC() ?: JSONObject.NULL)
                         .put("cache_reqs", 0).put("rss_mb", stats.rssBytes() / 1048576.0)
                         .put("mem", stats.mem())
                     if (!ws.send(Wire.pack(hb).toByteString())) break
@@ -224,6 +225,20 @@ class Node(
                 }
             } catch (_: InterruptedException) {}
         }.also { it.isDaemon = true; it.start() }
+    }
+
+    private fun fetchParallel(a: Int, b: Int, label: String): Long {
+        val count = b - a
+        if (count <= 0) return 0
+        val workers = minOf(4, count)
+        val pool = Executors.newFixedThreadPool(workers)
+        val futures = (a until b).map { i ->
+            pool.submit<Long> { fetch(layerFile(i), "$label  file ${i - a + 1}/$count") }
+        }
+        var total = 0L
+        for (f in futures) total += f.get()
+        pool.shutdown()
+        return total
     }
 
     /** Returns the bytes actually downloaded, 0 when the file was already here. */

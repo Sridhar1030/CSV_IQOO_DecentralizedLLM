@@ -4,7 +4,7 @@
 # assigned layers 8-15 fetches layer_08.tflite .. layer_15.tflite and chains them.
 # Decode signature only (n=1); the app drives prefill as a loop of decode steps.
 set -e
-V=/Users/chpatel/projects/CSV_IQOO_DecentralizedLLM/.venv-litert/bin/python
+V="$(cd "$(dirname "$0")/.." && pwd)/.venv-litert/bin/python"
 CACHE=${1:-512}
 N=$(python3 -c "import json;print(json.load(open('dist/config.json'))['num_hidden_layers'])")
 for i in $(seq 0 $((N-1))); do

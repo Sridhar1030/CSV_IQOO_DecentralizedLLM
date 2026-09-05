@@ -173,7 +173,7 @@ def _fmt(assignments) -> str:
 def _record(name, hdr):
     """A fresh node record. Everything the planner reads lives here, plus the socket and hub bookkeeping."""
     return {"name": name, "ws": None, "device": hdr.get("device"), "ram_gb": hdr.get("ram_gb"),
-            "ms_per_layer": None, "battery": None, "thermal": None, "mem_pct": None, "mem_available_bytes": None,
+            "ms_per_layer": None, "battery": None, "thermal": None, "nsp_temp_c": None, "mem_pct": None, "mem_available_bytes": None,
             "mem": None, "rss_mb": None, "cache_reqs": None, "layers": None, "present": False, "ready": False,
             "ineligible": False, "ema_ms_per_layer": None, "ema_samples": 0, "ema_wire_ms": None, "ema_batch": {},
             "disk": set(), "reassign": False, "bw_bps": None, "load_s_per_layer": None, "ready_at": None,
@@ -280,7 +280,8 @@ def _on_hb(n, hdr):
     mps = [p for _, _, _, p in hold if p is not None]
     n.update(battery=min(bats) if bats else None, thermal=max(ths) if ths else None, mem_pct=max(mps) if mps else None,
              mem_available_bytes=mem.get("sys_available_bytes"), mem=hdr.get("mem", n["mem"]),
-             rss_mb=hdr.get("rss_mb", n["rss_mb"]), cache_reqs=hdr.get("cache_reqs", n["cache_reqs"]))
+             rss_mb=hdr.get("rss_mb", n["rss_mb"]), cache_reqs=hdr.get("cache_reqs", n["cache_reqs"]),
+             nsp_temp_c=hdr.get("nsp_temp_c", n.get("nsp_temp_c")))
     n["mem_penalty_suppressed"] = n["ready_at"] is not None and now - n["ready_at"] < placement.MEM_PENALTY_GRACE_S
     n["ineligible"] = placement.ineligible_next(n["ineligible"], n["battery"], n["thermal"])
 
@@ -577,20 +578,62 @@ async def apply_plan(plan) -> str:
         pre = {}
         for m in changed:
             n = nodes[m]
-            if n["reassign"] and n["ws"] is not None and not set(range(*A[m])) <= n["disk"]:
+            if n["ws"] is None:
+                continue
+            if n["reassign"] and not set(range(*A[m])) <= n["disk"]:
                 pre[m] = _waiter("prefetched", m, G)
                 await _send(n, {"t": "prefetch", "layers": list(A[m]), "gen": G})
         got = await asyncio.gather(*(asyncio.wait_for(f, 30 + 2 * _mig(plan, m, "download_s")) for m, f in pre.items()),
                                    return_exceptions=True)
+        prefetch_failed = []
         for m, hdr in zip(pre, got):
             if isinstance(hdr, BaseException) or "error" in hdr:
-                for k in [k for k in waiters if k[2] == G]:
-                    waiters.pop(k).cancel()
                 why = f"prefetch failed: {m}" + ("" if isinstance(hdr, BaseException) else f" ({hdr['error']})")
+                print(f"  {why}", flush=True)
+                prefetch_failed.append(m)
+            else:
+                nodes[m]["disk"] |= set(range(*A[m]))
+        # If any node's prefetch failed or was absent, re-plan without them
+        absent_changed = [m for m in changed if nodes[m]["ws"] is None]
+        exclude = prefetch_failed + absent_changed
+        if exclude:
+            for k in [k for k in waiters if k[2] == G]:
+                waiters.pop(k).cancel()
+            try:
+                plan = compute_plan(exclude=exclude, force=True, min_nodes=1)
+            except Exception:
+                why = f"re-plan excluding {exclude} failed"
                 plan["reasons"].append(why); plan_state["last_reason"] = why
                 print(f"  plan gen {G} abandoned: {why}", flush=True)
                 return why
-            nodes[m]["disk"] |= set(range(*A[m]))
+            if not plan["would_apply"] or plan["missing_layers"]:
+                why = f"re-plan excluding {exclude}: no feasible plan"
+                plan["reasons"].append(why); plan_state["last_reason"] = why
+                print(f"  plan gen {G} abandoned: {why}", flush=True)
+                return why
+            A = plan["assignments"]
+            changed = [m for m, rng in A.items()
+                       if m in nodes and nodes[m]["ws"] is not None and
+                       (plan_state["assignments"].get(m) != rng or nodes[m]["layers"] != rng)]
+            print(f"  re-planned excluding {exclude}: {_fmt(A)}", flush=True)
+            # retry prefetch for the new plan
+            pre = {}
+            for m in changed:
+                n = nodes[m]
+                if n["ws"] is not None and n["reassign"] and not set(range(*A[m])) <= n["disk"]:
+                    pre[m] = _waiter("prefetched", m, G)
+                    await _send(n, {"t": "prefetch", "layers": list(A[m]), "gen": G})
+            got2 = await asyncio.gather(*(asyncio.wait_for(f, 30 + 2 * _mig(plan, m, "download_s")) for m, f in pre.items()),
+                                        return_exceptions=True)
+            for m, hdr in zip(pre, got2):
+                if isinstance(hdr, BaseException) or "error" in hdr:
+                    for k in [k for k in waiters if k[2] == G]:
+                        waiters.pop(k).cancel()
+                    why = f"prefetch retry failed: {m}"
+                    plan["reasons"].append(why); plan_state["last_reason"] = why
+                    print(f"  plan gen {G} abandoned: {why}", flush=True)
+                    return why
+                nodes[m]["disk"] |= set(range(*A[m]))
         # phase 2: drain. New generations wait at gen_gate; in-flight ones finish on the old layout.
         plan_state["rebalancing"] = True
         gen_gate.clear()

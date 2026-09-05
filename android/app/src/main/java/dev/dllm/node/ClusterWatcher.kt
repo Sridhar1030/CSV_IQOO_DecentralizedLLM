@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit
 class NodeView(
     val name: String, val device: String, val a: Int, val b: Int,
     val live: Boolean, val ready: Boolean, val msPerLayer: Double,
-    val battery: Int?, val sysPercent: Double?, val cpuPercent: Double?, val rssMb: Double?, val thermal: Int?,
+    val battery: Int?, val sysPercent: Double?, val cpuPercent: Double?, val rssMb: Double?, val thermal: Int?, val nspTempC: Double?,
     val hops: Long, val lastComputeMs: Double, val avgComputeMs: Double, val lastWireMs: Double,
     val lastPhase: String, val lastN: Int, val lastSeenMs: Long,
 )
@@ -129,6 +129,7 @@ class ClusterWatcher(private val hub: String, private val onState: (ClusterState
                         sysPercent = mem?.optDouble("sys_percent"), cpuPercent = mem?.optDouble("cpu_percent"),
                         rssMb = mem?.let { it.optDouble("rss_bytes") / 1048576.0 },
                         thermal = if (v.has("thermal") && !v.isNull("thermal")) v.optInt("thermal") else null,
+                        nspTempC = if (v.has("nsp_temp_c") && !v.isNull("nsp_temp_c")) v.optDouble("nsp_temp_c") else null,
                         hops = h?.hops ?: 0, lastComputeMs = h?.last ?: 0.0, avgComputeMs = h?.avg ?: 0.0,
                         lastWireMs = h?.wire ?: 0.0, lastPhase = h?.phase ?: "idle", lastN = h?.n ?: 0, lastSeenMs = h?.seen ?: 0,
                     ))

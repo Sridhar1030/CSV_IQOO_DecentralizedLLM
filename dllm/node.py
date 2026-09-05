@@ -99,16 +99,24 @@ def fetch_shards(http_base, shard_dir, a, b):
     """Download whatever [a, b) still lacks. Returns (bytes downloaded, seconds), which the hub
     turns into a bandwidth estimate; files already present cost nothing and count nothing.
     Downloads land in a .part file first so a socket drop mid-transfer never leaves a truncated
-    shard that looks complete on the next pass."""
+    shard that looks complete on the next pass. Downloads run in parallel (4 threads)."""
     os.makedirs(shard_dir, exist_ok=True)
     total, t0 = 0, time.time()
+    needed = []
     for f in ["config.json"] + [f"layer_{i:02d}.npz" for i in range(a, b)]:
         dst = f"{shard_dir}/{f}"
         if not os.path.exists(dst):
-            print("downloading", f, flush=True)
-            urllib.request.urlretrieve(f"{http_base}/shards/{f}", dst + ".part")
-            os.replace(dst + ".part", dst)
-            total += os.path.getsize(dst)
+            needed.append((f, dst))
+    def _dl(item):
+        f, dst = item
+        print(f"downloading {f}", flush=True)
+        urllib.request.urlretrieve(f"{http_base}/shards/{f}", dst + ".part")
+        os.replace(dst + ".part", dst)
+        return os.path.getsize(dst)
+    if needed:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(4, len(needed))) as pool:
+            total = sum(pool.map(_dl, needed))
     return total, time.time() - t0
 
 

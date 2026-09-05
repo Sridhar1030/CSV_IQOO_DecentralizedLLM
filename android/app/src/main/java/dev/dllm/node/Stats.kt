@@ -54,4 +54,19 @@ class Stats(private val ctx: Context) {
         val mi = ActivityManager.MemoryInfo(); am.getMemoryInfo(mi)
         return Math.round(mi.totalMem / 1073741824.0 * 10) / 10.0
     }
+
+    /** NSP (Hexagon HTP) temperature in millidegrees, averaged across all nsphvx/nsphmx zones.
+     *  Returns null if no NSP zones exist (non-Qualcomm SoC). */
+    fun nspTempC(): Double? {
+        val dir = java.io.File("/sys/class/thermal")
+        if (!dir.exists()) return null
+        var sum = 0.0; var count = 0
+        for (zone in dir.listFiles() ?: return null) {
+            val type = java.io.File(zone, "type").takeIf { it.canRead() }?.readText()?.trim() ?: continue
+            if (!type.startsWith("nsp")) continue
+            val temp = java.io.File(zone, "temp").takeIf { it.canRead() }?.readText()?.trim()?.toDoubleOrNull() ?: continue
+            sum += temp / 1000.0; count++
+        }
+        return if (count > 0) Math.round(sum / count * 10) / 10.0 else null
+    }
 }
