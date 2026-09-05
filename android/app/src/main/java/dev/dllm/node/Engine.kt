@@ -109,15 +109,17 @@ class CpuEngine : Engine {
      *  stores a Linear. Rows are split across threads; each row is copied out of the mapped
      *  buffer once and reused for all n tokens, so weight traffic is paid once per forward. */
     private fun matmul(w: Tensor, bias: FloatBuffer?, x: FloatArray, n: Int, out: FloatArray, outStride: Int, outOff: Int) {
-        val rows = w.shape[0]; val cols = w.shape[1]
+        val rows = w.rows; val cols = w.cols
         val chunk = (rows + threads - 1) / threads
         val tasks = (0 until rows step chunk).map { r0 ->
             Callable {
-                val src = w.data.duplicate()
+                // One reader per task: it decodes an int8 or int4 row into floats on the way in,
+                // so everything below is the same dot product whatever the shard stores.
+                val src = RowReader(w)
                 val row = FloatArray(cols)
                 val r1 = minOf(rows, r0 + chunk)
                 for (o in r0 until r1) {
-                    src.position(o * cols); src.get(row, 0, cols)
+                    src.read(o, row)
                     val b = bias?.get(o) ?: 0f
                     for (t in 0 until n) {
                         // Four independent float accumulators. A single Double accumulator forces

@@ -10,12 +10,58 @@ import java.security.MessageDigest
 import java.util.zip.Inflater
 
 /** One tensor from a .npz, memory-mapped straight out of the file.
- *  [raw] is the exact bytes numpy wrote (little-endian float32), which is also what the
- *  manifest hash covers. [data] is the same region viewed as floats. Nothing is copied into the
- *  Java heap, so a 500 MB shard costs no heap at all. */
-class Tensor(val name: String, val shape: IntArray, val raw: ByteBuffer) {
-    val data: FloatBuffer = raw.duplicate().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+ *  [raw] is the exact bytes numpy wrote, which is also what the manifest hash covers. [data] is
+ *  the same region viewed as floats, valid only for an fp32 tensor. Nothing is copied into the
+ *  Java heap, so a 500 MB shard costs no heap at all.
+ *
+ *  [dtype] is numpy's own descr: "f4" fp32, "i1" int8, "u1" int4 packed two codes per byte.
+ *  A quantised tensor carries its [scale] alongside, one fp32 per output row for int8 and one
+ *  per group of columns for int4. [cols] is the logical width, which for int4 is twice the
+ *  width of the bytes on disk. */
+class Tensor(val name: String, val shape: IntArray, val raw: ByteBuffer, val dtype: String = "f4") {
+    var scale: Tensor? = null
+    val data: FloatBuffer get() = raw.duplicate().order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+    val rows: Int get() = shape[0]
+    val cols: Int get() = if (dtype == "u1") shape[1] * 2 else shape[1]
     val size: Int get() = shape.fold(1) { a, b -> a * b }
+}
+
+/** Pulls one output row out of a tensor as fp32, whatever the shard stores it as, so the hot loop
+ *  below stays a plain float dot product. One per thread: it holds its own buffer positions. */
+class RowReader(private val t: Tensor) {
+    private val buf: ByteBuffer = t.raw.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+    private val floats: FloatBuffer = buf.asFloatBuffer()
+    private val sc: FloatBuffer? = t.scale?.raw?.duplicate()?.order(ByteOrder.LITTLE_ENDIAN)?.asFloatBuffer()
+    private val packed = ByteArray(if (t.dtype == "u1") t.cols / 2 else 0)
+    private val groups = if (t.dtype == "u1") t.scale!!.shape[1] else 0
+
+    fun read(o: Int, dst: FloatArray) {
+        val cols = t.cols
+        when (t.dtype) {
+            "f4" -> { floats.position(o * cols); floats.get(dst, 0, cols) }
+            "i1" -> {
+                buf.position(o * cols)
+                val s = sc!!.get(o)
+                for (i in 0 until cols) dst[i] = buf.get().toInt() * s
+            }
+            else -> {
+                val half = cols / 2
+                buf.position(o * half); buf.get(packed, 0, half)
+                val g = cols / groups
+                var i = 0
+                for (gi in 0 until groups) {
+                    val s = sc!!.get(o * groups + gi)
+                    val end = i + g
+                    while (i < end) {
+                        val v = packed[i / 2].toInt() and 0xFF
+                        dst[i] = ((v and 0x0F) - 8) * s
+                        dst[i + 1] = ((v shr 4) - 8) * s
+                        i += 2
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** Reads the .npz files dllm/slicer.py writes. np.savez stores entries uncompressed, so each
@@ -71,6 +117,10 @@ object Npz {
                 val key = name.removeSuffix(".npy")
                 out[key] = npy(key, bytes.order(ByteOrder.LITTLE_ENDIAN))
             }
+            // A quantised tensor keeps its own key and stores its scales under "<key>.scale".
+            // Hang each scale off its tensor so a reader needs only the one lookup; the scale
+            // entries stay in the map too, because the manifest hash covers every array.
+            for ((k, t) in out) if (k.endsWith(".scale")) out[k.removeSuffix(".scale")]?.scale = t
             return out
         }
     }
@@ -94,14 +144,19 @@ object Npz {
         val hb = b.duplicate(); hb.position(headerStart); hb.get(hdrBytes)
         val hdr = String(hdrBytes, Charsets.ISO_8859_1)
         val descr = Regex("'descr':\\s*'([^']+)'").find(hdr)!!.groupValues[1]
-        require(descr == "<f4") { "$name: dtype $descr, expected little-endian float32" }
+        val dtype = when (descr) {
+            "<f4" -> "f4"
+            "|i1" -> "i1"                                 // int8, one scale per output row
+            "|u1" -> "u1"                                 // int4, two codes per byte
+            else -> throw IllegalArgumentException("$name: dtype $descr is not one this node reads")
+        }
         require(Regex("'fortran_order':\\s*(True|False)").find(hdr)!!.groupValues[1] == "False") { "$name: fortran order" }
         val shape = Regex("'shape':\\s*\\(([^)]*)\\)").find(hdr)!!.groupValues[1]
             .split(",").map { it.trim() }.filter { it.isNotEmpty() }.map { it.toInt() }.toIntArray()
         val dataStart = headerStart + headerLen
         val db = b.duplicate(); db.position(dataStart)
         val raw = db.slice().order(ByteOrder.LITTLE_ENDIAN)
-        return Tensor(name, shape, raw)
+        return Tensor(name, shape, raw, dtype)
     }
 
     /** Matches dllm.slicer.content_hash byte for byte: sorted keys, then key, dtype, shape,
@@ -111,7 +166,7 @@ object Npz {
         for (k in tensors.keys.sorted()) {
             val t = tensors[k]!!
             md.update(k.toByteArray())
-            md.update("float32".toByteArray())
+            md.update(when (t.dtype) { "i1" -> "int8"; "u1" -> "uint8"; else -> "float32" }.toByteArray())
             val shape = if (t.shape.size == 1) "(${t.shape[0]},)" else t.shape.joinToString(", ", "(", ")")
             md.update(shape.toByteArray())
             md.update(t.raw.duplicate())
