@@ -88,8 +88,11 @@ class MainActivity : Activity() {
         if (d.scheme != "dllm") return
         val h = d.getQueryParameter("hub"); val c = d.getQueryParameter("code")
         h?.let { hub.setText(it) }; c?.let { code.setText(it) }
-        // Optional ?npu=1 selects the Hexagon NPU runtime, so the join link can pick the engine.
-        if (d.getBooleanQueryParameter("npu", false)) npu.isChecked = true
+        // Optional ?npu=1 selects the Hexagon NPU runtime and ?npu=0 forces the CPU one, so a join
+        // link picks the engine outright. It has to be able to say "no": the service is
+        // START_STICKY, so a phone that once joined on the NPU is restarted by Android with that
+        // same intent, and without this there is no way to move it back off tflite shards.
+        d.getQueryParameter("npu")?.let { npu.isChecked = it == "1" || it == "true" }
         if (!h.isNullOrBlank() && !c.isNullOrBlank()) join()
     }
 

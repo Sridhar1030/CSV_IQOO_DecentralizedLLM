@@ -201,6 +201,18 @@ class Shard(torch.nn.Module):
         self.to(device)
         self.cache = {}  # req -> list[(k, v)]
 
+    def reassign(self, shard_dir, a, b):
+        """Move to [a, b), keeping every layer already loaded. A plan change usually shifts a
+        boundary by a few layers, and rebuilding all of them from disk turned that into a minute
+        of answering "not loaded", which the hub read as the node failing. The KV cache goes:
+        its entries are indexed by position in the old range."""
+        have = {self.a + i: layer for i, layer in enumerate(self.layers)}
+        self.layers = torch.nn.ModuleList(
+            have[i] if i in have else Layer(self.cfg, load_npz(f"{shard_dir}/layer_{i:02d}.npz")).to(self.device_)
+            for i in range(a, b))
+        self.a, self.b = a, b
+        self.cache = {}
+
     @torch.no_grad()
     def forward(self, x, pos, req="default"):
         x, pos = x.to(self.device_), pos.to(self.device_)

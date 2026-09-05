@@ -117,7 +117,7 @@ class Node(
                 var dl = fetch("config.json")
                 dl += fetchParallel(a, b, "layers $a-${b - 1}")
                 val downloadS = (System.nanoTime() - tf) / 1e9
-                dropForeign(a, b)
+                dropForeign()
                 val c = ModelConfig(JSONObject(File(shardDir, "config.json").readText()))
                 ui("loading", "layers $a-${b - 1} into ${engine.name}")
                 val t0 = System.nanoTime()
@@ -265,14 +265,15 @@ class Node(
         Regex("layer_(\\d\\d)\\.${engine.shardExt}").matchEntire(f.name)?.groupValues?.get(1)?.toInt()
     }.sorted()
 
-    /** A node keeps only the layers it owns, exactly as the Python nodes do. Both shard kinds are
-     *  swept, so switching a phone between the CPU and NPU runtime never leaves the other runtime's
-     *  weights behind. */
-    private fun dropForeign(a: Int, b: Int) {
+    /** Layers stay on disk whichever range this phone holds. They are memory-mapped, so an unused
+     *  shard costs storage and nothing else, and the next reassignment finds it already here
+     *  instead of pulling it over wifi again; the hub sees them in `disk` and skips the prefetch.
+     *  Only the other runtime's shards are swept, so switching between the CPU and NPU engines
+     *  never leaves the wrong kind behind. */
+    private fun dropForeign() {
         shardDir.listFiles()?.forEach { f ->
             val m = Regex("layer_(\\d\\d)\\.(npz|tflite)").matchEntire(f.name) ?: return@forEach
-            val i = m.groupValues[1].toInt()
-            if (i < a || i >= b || m.groupValues[2] != engine.shardExt) f.delete()
+            if (m.groupValues[2] != engine.shardExt) f.delete()
         }
     }
 }

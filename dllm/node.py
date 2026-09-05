@@ -23,18 +23,6 @@ def fingerprint(shard_dir, i):
     return h.hexdigest()[:16]
 
 
-def drop_foreign_shards(shard_dir, a, b):
-    """A node keeps only the layers it owns. Anything left over from an earlier assignment goes,
-    otherwise a node that has been reassigned quietly accumulates the whole model."""
-    removed = []
-    for f in sorted(os.listdir(shard_dir)):
-        if f.startswith("layer_") and f.endswith(".npz") and not (a <= int(f[6:8]) < b):
-            os.remove(f"{shard_dir}/{f}"); removed.append(f)
-    if removed:
-        print(f"removed {len(removed)} shard(s) outside layers {a}-{b-1}: {', '.join(removed)}", flush=True)
-    return removed
-
-
 _cpu_last = None
 
 
@@ -120,15 +108,19 @@ def fetch_shards(http_base, shard_dir, a, b):
     return total, time.time() - t0
 
 
-def load_range(http_base, shard_dir, a, b, device="cpu"):
-    """Fetch, drop foreign shards, build the shard, warm it, bench it. One function for the first
-    assign and for a reassign, so both paths measure and report exactly the same things.
+def load_range(http_base, shard_dir, a, b, device="cpu", shard=None):
+    """Fetch what is missing, build or re-range the shard, warm it, bench it. One function for the
+    first assign and for a reassign, so both paths measure and report exactly the same things.
+    Shards stay on disk whichever range this node holds: an unused file costs nothing at runtime,
+    and the next plan that hands the layer back finds it here rather than downloading it again.
     Blocking by design: run it in a thread so heartbeats keep flowing during a long download."""
     dl_bytes, dl_s = fetch_shards(http_base, shard_dir, a, b)
-    drop_foreign_shards(shard_dir, a, b)
     cfg = Cfg.load(f"{shard_dir}/config.json")
     t0 = time.time()
-    shard = Shard(cfg, shard_dir, a, b, device=device)
+    if shard is None:
+        shard = Shard(cfg, shard_dir, a, b, device=device)
+    else:
+        shard.reassign(shard_dir, a, b)
     # warm up + bench: one 1-token forward through own layers
     shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_bench"); shard.reset("_bench")
     load_s = time.time() - t0
@@ -191,10 +183,10 @@ async def run(args):
                     await ws.send(pack({"t": "ready", **ready_fields, "gen": gen, "reassigned": True, "rss_mb": rss_mb()}))
                     return
                 reassigned = had_ready
-                shard = None                       # forwards answer "not loaded" until the new range is up
+                prev, shard = shard, None          # forwards answer "not loaded" until the new range is up
                 args.layers = f"{a}-{b}"           # reclaim this exact range if the connection drops and we retry
                 try:
-                    shard, cfg, ready_fields = await asyncio.to_thread(load_range, http_base, args.shards, a, b, args.device)
+                    shard, cfg, ready_fields = await asyncio.to_thread(load_range, http_base, args.shards, a, b, args.device, prev)
                 except Exception as e:
                     # Say so, or the hub sees a heartbeating node that never answers and waits out its deadline.
                     traceback.print_exc()
