@@ -28,6 +28,9 @@ class ModelConfig(j: JSONObject) {
  *  in [Engines]. A node holds layers [a, b) and its own KV cache, keyed by request id. */
 interface Engine {
     val name: String
+    /** File extension of the per-layer shards this engine downloads: "npz" for the Kotlin CPU
+     *  engine, "tflite" for the NPU engine. The hub serves layer_XX.<ext> either way. */
+    val shardExt: String get() = "npz"
     fun load(dir: File, a: Int, b: Int, cfg: ModelConfig)
     /** x is n rows of cfg.hidden floats at absolute positions pos..pos+n-1. Returns the same shape. */
     fun forward(x: FloatArray, n: Int, pos: Int, req: String): FloatArray

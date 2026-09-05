@@ -40,7 +40,9 @@ class NodeService : Service() {
             .also { it.acquire() }
 
         stopNode()
-        val engine = Engines.byName(engineName)
+        val engine = if (engineName == "npu")
+            NpuEngine(applicationInfo.nativeLibraryDir, File(cacheDir, "litert").apply { mkdirs() }.absolutePath)
+        else Engines.byName(engineName)
         NodeState.engine = engine.name
         val n = Node(hub, code, name, engine, File(filesDir, "shards"), Stats(this),
             ui = { s, d -> NodeState.set(s, d); update(notification("$s  $d")) },

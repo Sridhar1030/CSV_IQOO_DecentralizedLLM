@@ -67,6 +67,9 @@
             android:layout_marginStart="8dp" android:hint="code" android:inputType="textCapCharacters" android:textSize="13sp"
             android:textColor="#E6EDF3" android:textColorHint="#5B6773" android:backgroundTint="#30363D" />
     </LinearLayout>
+    <CheckBox android:id="@+id/npu" android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:layout_marginTop="4dp" android:text="Run layers on the Hexagon NPU" android:textSize="13sp"
+        android:textColor="#E6EDF3" android:buttonTint="#7EE787" />
     <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:orientation="horizontal">
         <Button android:id="@+id/join" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Join" />
         <Button android:id="@+id/leave" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:layout_marginStart="8dp" android:text="Leave" />

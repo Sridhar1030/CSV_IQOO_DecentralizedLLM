@@ -13,6 +13,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -24,6 +25,7 @@ class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var hub: EditText
     private lateinit var code: EditText
+    private lateinit var npu: CheckBox
     private lateinit var pipeline: TextView
     private lateinit var tps: TextView
     private lateinit var tokens: TextView
@@ -48,7 +50,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)   // a demo phone must not sleep
-        hub = findViewById(R.id.hub); code = findViewById(R.id.code)
+        hub = findViewById(R.id.hub); code = findViewById(R.id.code); npu = findViewById(R.id.npu)
         pipeline = findViewById(R.id.pipeline); tps = findViewById(R.id.tps); tokens = findViewById(R.id.tokens)
         strip = findViewById(R.id.strip); stripLabels = findViewById(R.id.stripLabels); nodesBox = findViewById(R.id.nodes)
         output = findViewById(R.id.output); selfStatus = findViewById(R.id.selfStatus); selfDetail = findViewById(R.id.selfDetail)
@@ -73,7 +75,8 @@ class MainActivity : Activity() {
         if (h.isEmpty()) { selfStatus.text = "hub address needed"; return }
         getSharedPreferences("dllm", MODE_PRIVATE).edit().putString("hub", h).putString("code", c).apply()
         val svc = Intent(this, NodeService::class.java)
-            .putExtra("hub", h).putExtra("code", c).putExtra("name", nodeName()).putExtra("engine", "cpu")
+            .putExtra("hub", h).putExtra("code", c).putExtra("name", nodeName())
+            .putExtra("engine", if (npu.isChecked) "npu" else "cpu")
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
         watch(h)
     }
@@ -85,6 +88,8 @@ class MainActivity : Activity() {
         if (d.scheme != "dllm") return
         val h = d.getQueryParameter("hub"); val c = d.getQueryParameter("code")
         h?.let { hub.setText(it) }; c?.let { code.setText(it) }
+        // Optional ?npu=1 selects the Hexagon NPU runtime, so the join link can pick the engine.
+        if (d.getBooleanQueryParameter("npu", false)) npu.isChecked = true
         if (!h.isNullOrBlank() && !c.isNullOrBlank()) join()
     }
 

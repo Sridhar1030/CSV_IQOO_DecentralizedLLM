@@ -15,6 +15,12 @@
         android:largeHeap="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
+        <!-- The Hexagon HTP is reached over FastRPC. libQnnHtpV81Stub.so needs the vendor client
+             libcdsprpc.so, which is a public vendor library but must be declared for the app's
+             linker namespace to see it (Android 10+). required=false so non-Qualcomm phones, which
+             use the CPU engine, still install. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

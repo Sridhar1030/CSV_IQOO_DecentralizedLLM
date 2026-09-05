@@ -93,8 +93,9 @@ class Node(
                 ui("downloading", "layers $a-${b - 1}")
                 shardDir.mkdirs()
                 fetch("config.json")
-                for (i in a until b) fetch("layer_%02d.npz".format(i), "file ${i - a + 1} of ${b - a}  (layers $a-${b - 1})")
-                dropForeign(a, b)
+                val ext = engine.shardExt
+                for (i in a until b) fetch("layer_%02d.$ext".format(i), "file ${i - a + 1} of ${b - a}  (layers $a-${b - 1})")
+                dropForeign(a, b, ext)
                 val c = ModelConfig(JSONObject(File(shardDir, "config.json").readText())); cfg = c
                 ui("loading", "layers $a-${b - 1} into ${engine.name}")
                 val t0 = System.nanoTime()
@@ -181,12 +182,14 @@ class Node(
         }
     }
 
-    /** A node keeps only the layers it owns, exactly as the Python nodes do. */
-    private fun dropForeign(a: Int, b: Int) {
+    /** A node keeps only the layers it owns, exactly as the Python nodes do. Both shard kinds are
+     *  swept (npz and tflite), so switching a phone between the CPU and NPU runtime never leaves the
+     *  other runtime's weights behind. */
+    private fun dropForeign(a: Int, b: Int, ext: String) {
         shardDir.listFiles()?.forEach { f ->
-            val m = Regex("layer_(\\d\\d)\\.npz").matchEntire(f.name) ?: return@forEach
+            val m = Regex("layer_(\\d\\d)\\.(npz|tflite)").matchEntire(f.name) ?: return@forEach
             val i = m.groupValues[1].toInt()
-            if (i < a || i >= b) f.delete()
+            if (i < a || i >= b || m.groupValues[2] != ext) f.delete()
         }
     }
 }

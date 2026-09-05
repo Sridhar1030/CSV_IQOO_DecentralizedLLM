@@ -9,10 +9,21 @@ android {
 
     defaultConfig {
         applicationId = "dev.dllm.node"
-        minSdk = 26
+        // 31 is what the Qualcomm LiteRT NPU runtime libraries require; the target phones are API 36.
+        minSdk = 31
         targetSdk = 35
         versionCode = 1
         versionName = "0.1"
+        ndk { abiFilters += "arm64-v8a" }   // the QNN + LiteRT .so ship arm64 only
+    }
+    // The QNN skel is loaded by the DSP over FastRPC and the dispatch/compiler plugins are dlopen'd
+    // by path, so the native libraries must be real files in the app's lib dir, not left compressed
+    // inside the APK. Legacy packaging extracts them on install.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += "**/*.so"
+        }
     }
     buildTypes {
         release {
