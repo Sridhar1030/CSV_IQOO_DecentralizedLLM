@@ -555,8 +555,16 @@ def plan(recs, current, n_layers, layer_bytes, util=UTIL_DEFAULT, min_layers=MIN
     standby = evict_order([m for m in cands if m not in assignments], costs, pred)
     standby_reasons = {}
     for m in standby:
-        if costs[m]["ram"] < min_layers or m not in best_with:
-            standby_reasons[m] = f"would hold fewer than {min_layers} layers"
+        # These two used to share a message, which made a node with plenty of RAM read as if it had
+        # none. They are different failures: the first is this node's own capacity, the second is
+        # that no set of nodes INCLUDING it can cover the model at all, usually because the others
+        # are too small or too few. Saying how many layers it could hold makes that unambiguous.
+        if costs[m]["ram"] < min_layers:
+            standby_reasons[m] = (f"would hold fewer than {min_layers} layers "
+                                  f"(its RAM allows {costs[m]['ram']})")
+        elif m not in best_with:
+            standby_reasons[m] = (f"no plan including it covers all {n_layers} layers "
+                                  f"(it could hold {costs[m]['ram']})")
         elif best is None:
             standby_reasons[m] = "no feasible plan"
         else:
