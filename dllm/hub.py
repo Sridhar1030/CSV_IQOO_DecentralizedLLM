@@ -1,19 +1,28 @@
 """Coordinator: lobby + hub + embed/lm_head/sampling + OpenAI endpoint + shard server.
 python -m dllm.hub --shards shards --expected 4 --port 8000"""
-import argparse, asyncio, json, math, os, random, string, time, uuid
+import argparse, asyncio, json, math, os, random, socket, string, time, uuid
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse, PlainTextResponse
 from transformers import AutoTokenizer
-from dllm.model import Cfg, Head
-from dllm.wire import pack, unpack, to_bf16_bytes, from_bf16_bytes
+from dllm.model import Cfg, Head, sample
+from dllm.observe import Observability
+from dllm.wire import pack, unpack, to_bytes, from_bytes
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--shards", default="shards")
+ap.add_argument("--dist", default=None,
+                help="directory of layer shards to hand out to joining nodes. Kept separate from "
+                     "--shards so the coordinator itself never has to hold the whole model. Delete "
+                     "it once every node has loaded.")
 ap.add_argument("--expected", type=int, default=int(os.getenv("EXPECTED_NODES", 4)))
 ap.add_argument("--port", type=int, default=8000)
 ap.add_argument("--code", default="".join(random.choices(string.ascii_uppercase + string.digits, k=6)))
 ap.add_argument("--device", default="cpu")
+ap.add_argument("--otlp", default=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+                help="OTLP/HTTP endpoint for traces and metrics, normally the llmobs proxy "
+                     "(http://localhost:8100). Unset disables telemetry entirely.")
+ap.add_argument("--node-id", default=None, help="This coordinator's identity in telemetry. Default: hostname.")
 ARGS, _ = ap.parse_known_args()
 
 app = FastAPI(title="dllm hub")
@@ -23,7 +32,10 @@ head = Head(cfg, ARGS.shards, ARGS.device)
 gen_cfg = json.load(open(f"{ARGS.shards}/generation_config.json")) if os.path.exists(f"{ARGS.shards}/generation_config.json") else {}
 EOS = set(gen_cfg.get("eos_token_id", [tok.eos_token_id]) if isinstance(gen_cfg.get("eos_token_id"), list) else [gen_cfg.get("eos_token_id", tok.eos_token_id)])
 
-nodes = {}          # name -> dict(ws, layers, ready, ms_per_layer, battery, last_hb)
+MODEL_NAME = (json.load(open(f"{ARGS.shards}/manifest.json")).get("repo", "dllm")
+              if os.path.exists(f"{ARGS.shards}/manifest.json") else "dllm")
+
+nodes = {}          # name -> dict(ws, layers, ready, ms_per_layer, battery, mem, last_hb)
 pending = {}        # (req, hop) -> Future
 events = []         # list of asyncio.Queue for /events SSE listeners
 gen_lock = asyncio.Lock()   # ponytail: one request at a time; batching is ADR-006, later
@@ -35,9 +47,48 @@ def emit(ev):
         q.put_nowait(ev)
 
 
+HB_TIMEOUT = 5.0  # a node that has not sent a heartbeat this recently is treated as gone
+
+
+def live(n):
+    return n["ready"] and (time.time() - n["last_hb"]) < HB_TIMEOUT
+
+
+obs = Observability(endpoint=ARGS.otlp, model=MODEL_NAME, n_layers=cfg.n_layers, node_id=ARGS.node_id,
+                    nodes=lambda: [(k, v, live(v)) for k, v in nodes.items()])
+
+
+@app.on_event("shutdown")
+def _flush_telemetry():
+    obs.shutdown()
+
+
+def missing_layers() -> list[int]:
+    """Layers no live node holds. This is the whole reason a request gets refused, so say it."""
+    have = set()
+    for n in nodes.values():
+        if live(n):
+            have |= set(range(*n["layers"]))
+    return sorted(set(range(cfg.n_layers)) - have)
+
+
+def _ranges(xs: list[int]) -> str:
+    """[8,9,10,20] -> '8-10,20'"""
+    out, start = [], None
+    for i, x in enumerate(xs):
+        if start is None:
+            start = x
+        if i + 1 == len(xs) or xs[i + 1] != x + 1:
+            out.append(str(start) if start == x else f"{start}-{x}")
+            start = None
+    return ",".join(out)
+
+
 def pipeline():
-    """Ordered ready nodes. Valid only if they tile [0, n_layers) exactly."""
-    ready = sorted((n for n in nodes.values() if n["ready"]), key=lambda n: n["layers"][0])
+    """Ordered live nodes. Valid only if they tile [0, n_layers) exactly.
+    A node whose heartbeat has stopped is excluded even if its socket is still open, so a wedged
+    or unreachable device fails the request instead of hanging it."""
+    ready = sorted((n for n in nodes.values() if live(n)), key=lambda n: n["layers"][0])
     want = 0
     for n in ready:
         if n["layers"][0] != want:
@@ -46,10 +97,17 @@ def pipeline():
     return ready if want == cfg.n_layers else None
 
 
-def assign_layers(hello):
+assigned = {}   # node name -> layer range, kept across reconnects
+
+
+def assign_layers(name, hello):
+    """Sticky by name. A node that drops and comes back gets its own range, never a neighbour's.
+    New ranges are packed after whatever is already handed out, including to absent nodes."""
     if "layers" in hello:
         return hello["layers"]
-    taken = sorted(n["layers"] for n in nodes.values())
+    if name in assigned:
+        return assigned[name]
+    taken = sorted(assigned.values())
     start = taken[-1][1] if taken else 0
     chunk = math.ceil(cfg.n_layers / ARGS.expected)
     return [start, min(start + chunk, cfg.n_layers)]
@@ -62,7 +120,8 @@ async def ws_node(ws: WebSocket):
     if hdr.get("t") != "hello" or hdr.get("code") != ARGS.code:
         await ws.send_bytes(pack({"t": "error", "msg": "bad lobby code"})); await ws.close(); return
     name = hdr["name"]
-    layers = assign_layers(hdr)
+    layers = assign_layers(name, hdr)
+    assigned[name] = layers
     nodes[name] = {"ws": ws, "layers": layers, "ready": False, "ms_per_layer": None, "battery": None,
                    "device": hdr.get("device"), "ram_gb": hdr.get("ram_gb"), "last_hb": time.time()}
     await ws.send_bytes(pack({"t": "assign", "layers": layers}))
@@ -72,10 +131,15 @@ async def ws_node(ws: WebSocket):
             hdr, payload = unpack(await ws.receive_bytes())
             t = hdr["t"]
             if t == "ready":
-                nodes[name].update(ready=True, layers=hdr["layers"], ms_per_layer=hdr["ms_per_layer"])
+                assigned[name] = hdr["layers"]
+                nodes[name].update(ready=True, layers=hdr["layers"], ms_per_layer=hdr["ms_per_layer"],
+                                   rss_mb=hdr.get("rss_mb"), shard_dir=hdr.get("shard_dir"),
+                                   files=hdr.get("files", []), fingerprints=hdr.get("fingerprints", {}))
                 emit({"t": "ready", "node": name, "layers": hdr["layers"], "ms_per_layer": hdr["ms_per_layer"]})
             elif t == "hb":
-                nodes[name].update(battery=hdr.get("battery"), last_hb=time.time())
+                nodes[name].update(battery=hdr.get("battery"), last_hb=time.time(),
+                                   rss_mb=hdr.get("rss_mb", nodes[name].get("rss_mb")),
+                                   mem=hdr.get("mem", nodes[name].get("mem")))
             elif t == "fwd_out":
                 fut = pending.pop((hdr["req"], hdr["hop"]), None)
                 if fut and not fut.done():
@@ -90,41 +154,51 @@ async def ws_node(ws: WebSocket):
                 f.set_exception(RuntimeError(f"node {name} left"))
 
 
-async def forward_all(req, x, pos):
+async def forward_all(req, x, pos, trace=None):
     """Run hidden x (1, n, hidden) through every node in layer order. Returns final hidden."""
     pipe = pipeline()
     if not pipe:
         raise RuntimeError(f"pipeline incomplete: {[ (n['layers']) for n in nodes.values() ]}")
     n = x.shape[1]
+    dt = "bf16"
     for hop, node in enumerate(pipe):
+        # the tail node's output feeds the lm_head, so it comes back in fp32
+        out_dt = "fp32" if hop == len(pipe) - 1 else "bf16"
         fut = asyncio.get_event_loop().create_future()
         pending[(req, hop)] = fut
         t = time.time()
-        await node["ws"].send_bytes(pack({"t": "fwd", "req": req, "hop": hop, "pos": pos, "n": n}, to_bf16_bytes(x)))
+        await node["ws"].send_bytes(pack({"t": "fwd", "req": req, "hop": hop, "pos": pos, "n": n,
+                                          "dtype": dt, "out_dtype": out_dt}, to_bytes(x, dt)))
         hdr, payload = await asyncio.wait_for(fut, timeout=120)
-        x = from_bf16_bytes(payload, (1, n, cfg.hidden))
-        emit({"t": "hop", "req": req, "hop": hop, "node": [k for k, v in nodes.items() if v is node][0],
-              "layers": node["layers"], "n": n, "compute_ms": hdr["ms"], "wire_ms": (time.time() - t) * 1000 - hdr["ms"]})
+        t_end = time.time()
+        x = from_bytes(payload, (1, n, cfg.hidden), hdr.get("dtype", out_dt))
+        dt = out_dt
+        name = next(k for k, v in nodes.items() if v is node)
+        wire_ms = (t_end - t) * 1000 - hdr["ms"]
+        emit({"t": "hop", "req": req, "hop": hop, "node": name,
+              "layers": node["layers"], "n": n, "compute_ms": hdr["ms"], "wire_ms": wire_ms})
+        if trace:
+            trace.hop(index=hop, name=name, node=node, n=n, pos=pos, started=t, ended=t_end,
+                      compute_ms=hdr["ms"], wire_ms=wire_ms)
     return x
 
 
-async def generate(ids, max_tokens=256, temperature=0.0):
+async def generate(ids, max_tokens=256, temperature=0.0, top_p=1.0, top_k=0, seed=None, trace=None):
     req = uuid.uuid4().hex[:8]
     pipe = pipeline()
     try:
-        x = await forward_all(req, head.embed_tokens(ids), 0)
+        x = await forward_all(req, head.embed_tokens(ids), 0, trace)
         pos = len(ids)
         for _ in range(max_tokens):
             lg = head.logits(x)
-            if temperature > 0:
-                nxt = int(torch.multinomial(torch.softmax(lg / temperature, -1), 1))
-            else:
-                nxt = int(lg.argmax())
+            nxt = sample(lg, temperature, top_p, top_k, None if seed is None else seed + pos)
             if nxt in EOS:
                 break
+            if trace:
+                trace.first_token()
             emit({"t": "token", "req": req, "id": nxt, "pos": pos})
             yield nxt
-            x = await forward_all(req, head.embed_tokens([nxt]), pos)
+            x = await forward_all(req, head.embed_tokens([nxt]), pos, trace)
             pos += 1
     finally:
         for node in pipe or []:
@@ -137,26 +211,57 @@ async def chat(request: Request):
     body = await request.json()
     prompt = tok.apply_chat_template(body["messages"], add_generation_prompt=True, tokenize=False)
     ids = tok(prompt, add_special_tokens=False).input_ids
-    max_tokens, temp = body.get("max_tokens", 256), body.get("temperature", 0.0)
+    max_tokens = body.get("max_tokens", 256)
+    temp = body.get("temperature") or 0.0
+    top_p = body.get("top_p", 1.0)
+    top_k = body.get("top_k", 0)
+    seed = body.get("seed")
     cid, created = f"chatcmpl-{uuid.uuid4().hex[:12]}", int(time.time())
     if pipeline() is None:
-        return JSONResponse({"error": "pipeline incomplete", "nodes": {k: v["layers"] for k, v in nodes.items()}}, 503)
+        gaps = missing_layers()
+        held = {k: f"{v['layers'][0]}-{v['layers'][1]-1}" for k, v in nodes.items() if live(v)}
+        return JSONResponse({
+            "error": "pipeline incomplete",
+            "detail": (f"no live node holds layer(s) {_ranges(gaps)} of {cfg.n_layers}. "
+                       f"Start a node for them, or scan {join_url()} on a phone."
+                       if gaps else "nodes overlap or do not start at layer 0"),
+            "missing_layers": _ranges(gaps),
+            "live_nodes": held,
+            "join_url": join_url(),
+        }, 503)
+    trace = obs.request(request_id=cid, input_tokens=len(ids), max_tokens=max_tokens, temperature=temp)
+    finish = lambda n: "length" if n >= max_tokens else "stop"
 
     async def run_stream():
-        async with gen_lock:
-            async for t in generate(ids, max_tokens, temp):
-                chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "dllm",
-                         "choices": [{"index": 0, "delta": {"content": tok.decode([t])}, "finish_reason": None}]}
-                yield f"data: {json.dumps(chunk)}\n\n"
-            yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'dllm', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-            yield "data: [DONE]\n\n"
+        n = 0
+        try:
+            async with gen_lock:
+                async for t in generate(ids, max_tokens, temp, top_p, top_k, seed, trace):
+                    n += 1
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "dllm",
+                             "choices": [{"index": 0, "delta": {"content": tok.decode([t])}, "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': 'dllm', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish(n)}]})}\n\n"
+                yield "data: [DONE]\n\n"
+        except BaseException as e:
+            trace.error(e, output_tokens=n)
+            raise
+        else:
+            trace.finish(output_tokens=n, finish_reason=finish(n))
 
     if body.get("stream"):
         return StreamingResponse(run_stream(), media_type="text/event-stream")
-    async with gen_lock:
-        out = [t async for t in generate(ids, max_tokens, temp)]
+    out = []
+    try:
+        async with gen_lock:
+            async for t in generate(ids, max_tokens, temp, top_p, top_k, seed, trace):
+                out.append(t)
+    except BaseException as e:
+        trace.error(e, output_tokens=len(out))
+        raise
+    trace.finish(output_tokens=len(out), finish_reason=finish(len(out)))
     return {"id": cid, "object": "chat.completion", "created": created, "model": "dllm",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": tok.decode(out)}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": tok.decode(out)}, "finish_reason": finish(len(out))}],
             "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out), "total_tokens": len(ids) + len(out)}}
 
 
@@ -167,13 +272,90 @@ def models():
 
 @app.get("/shards/{name}")
 def shard_file(name: str):
-    return FileResponse(f"{ARGS.shards}/{os.path.basename(name)}")
+    name = os.path.basename(name)
+    if ARGS.dist and os.path.exists(f"{ARGS.dist}/{name}"):
+        return FileResponse(f"{ARGS.dist}/{name}")
+    return FileResponse(f"{ARGS.shards}/{name}")
+
+
+@app.get("/s/{name}/{layers}", response_class=PlainTextResponse)
+def setup_sh_path(name: str, layers: str, request: Request):
+    """Path form so it can be typed without ? or & :  curl 127.0.0.1:8000/s/phoneB/16-24 | sh"""
+    return setup_sh(layers=layers, name=name, host=request.headers.get("host"))
+
+
+# ---------------------------------------------------------------------------------------------
+# Joining by camera. One URL does both jobs, chosen by what asked for it: a browser gets a page,
+# curl gets the shell script. So the QR can carry a plain http:// link any camera app will open,
+# and the same link piped through sh brings the node up.
+# ---------------------------------------------------------------------------------------------
+def lan_ip() -> str:
+    """This machine's address on a network a phone can reach, rather than 127.0.0.1."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))      # sends nothing; this only picks the outbound route
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def join_url(host: str | None = None) -> str:
+    return f"http://{host or f'{lan_ip()}:{ARGS.port}'}/j/{ARGS.code}"
+
+
+def sh_error(message: str, status: int = 404) -> PlainTextResponse:
+    """An error on this endpoint is usually about to be piped into a shell, so it has to BE a shell
+    script. Returning prose gets you `sh: 1: wrong: not found`, which tells the user nothing."""
+    safe = message.replace("'", "'\\''")
+    return PlainTextResponse(f"echo '{safe}' >&2\nexit 1\n", status_code=status,
+                             media_type="text/plain")
+
+
+@app.get("/j/{code}")
+def join(code: str, request: Request):
+    """Scanned by a camera, or piped to sh. Same URL, different answer."""
+    host = request.headers.get("host")
+    wants_html = "text/html" in request.headers.get("accept", "")
+    if code.strip().upper() != ARGS.code.upper():
+        msg = f"dllm: wrong lobby code '{code}'. This cluster's code is {ARGS.code}. Try: curl -s {join_url(host)} | sh"
+        return HTMLResponse(f"<pre>{msg}</pre>", status_code=404) if wants_html else sh_error(msg)
+    name = f"node{len(assigned) + 1}"
+    if not wants_html:
+        return PlainTextResponse(setup_sh(name=name, host=host), media_type="text/plain")
+    taken = sorted(assigned.values())
+    start = taken[-1][1] if taken else 0
+    return HTMLResponse(f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Join the cluster</title>
+<style>body{{font:16px/1.55 system-ui;margin:0;padding:24px;background:#0b0d10;color:#e6edf3}}
+h1{{font-size:20px;margin:0 0 4px}}p{{color:#9aa7b4;margin:6px 0 18px}}
+code{{display:block;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;
+font:14px/1.5 ui-monospace,monospace;color:#7ee787;word-break:break-all;user-select:all;-webkit-user-select:all}}
+b{{color:#e6edf3}}ol{{padding-left:20px;color:#9aa7b4}}li{{margin:10px 0}}</style>
+<h1>Join as <b>{name}</b></h1>
+<p>Lobby <b>{ARGS.code}</b> &middot; {len(assigned)} node(s) already in &middot;
+{cfg.n_layers - start} of {cfg.n_layers} layers still unassigned</p>
+<ol><li>Press and hold the command below, copy it.</li>
+<li>Open <b>Termux</b>, paste, press enter.</li></ol>
+<code>curl -s {join_url(host)} | sh</code>
+<p>Joined once already? Use your browser's Share button and pick Termux instead.</p>
+""")
+
+
+@app.get("/qr.svg")
+def qr_svg(request: Request):
+    """The same join URL as a scannable image, for putting on a projector."""
+    import segno
+    return Response(segno.make(join_url(request.headers.get("host")), error="m").svg_inline(scale=8),
+                    media_type="image/svg+xml")
 
 
 @app.get("/s", response_class=PlainTextResponse)
 @app.get("/setup.sh", response_class=PlainTextResponse)
-def setup_sh(layers: str = "", name: str = "phoneA"):
-    """Phone bootstrap. In Termux:  pkg i -y curl && curl -s 127.0.0.1:8000/setup.sh | bash"""
+def setup_sh(layers: str = "", name: str = "phoneA", host: str | None = None):
+    """Phone bootstrap. In Termux:  curl -s 127.0.0.1:8000/s | sh"""
+    host = host or f"127.0.0.1:{ARGS.port}"
     return f"""set -e
 echo '== installing python + numpy (prebuilt, not pip) =='
 pkg update -y >/dev/null 2>&1 || true
@@ -181,10 +363,21 @@ pkg install -y python python-numpy
 python -c 'import numpy' || {{ echo 'numpy missing'; exit 1; }}
 pip install --quiet websockets
 echo '== fetching node source =='
-curl -sO http://127.0.0.1:{ARGS.port}/node.py
+curl -sO http://{host}/node.py
+mkdir -p ~/bin
+printf '#!%s/bin/sh\\ncurl -s "$1" | sh\\n' "$PREFIX" > ~/bin/termux-url-opener
+chmod +x ~/bin/termux-url-opener
 echo '== joining cluster as {name} =='
-exec python node.py --hub ws://127.0.0.1:{ARGS.port}/ws/node --code {ARGS.code} --name {name} {'--layers ' + layers if layers else ''}
+exec python node.py --hub ws://{host}/ws/node --code {ARGS.code} --name {name} {'--layers ' + layers if layers else ''}
 """
+
+
+@app.exception_handler(404)
+async def not_found(request: Request, exc):
+    """Same reasoning as sh_error: /s/... and /j/... get piped into a shell."""
+    if "text/html" in request.headers.get("accept", ""):
+        return HTMLResponse(f"<pre>dllm: no such path {request.url.path}</pre>", status_code=404)
+    return sh_error(f"dllm: no such path {request.url.path} on this hub")
 
 
 @app.get("/node.py")
@@ -195,8 +388,52 @@ def node_source():
 
 @app.get("/status")
 def status():
+    now = time.time()
     return {"code": ARGS.code, "n_layers": cfg.n_layers, "pipeline_ok": pipeline() is not None,
-            "nodes": {k: {kk: vv for kk, vv in v.items() if kk != "ws"} for k, v in nodes.items()}}
+            "missing_layers": _ranges(missing_layers()), "join_url": join_url(),
+            "nodes": {k: {**{kk: vv for kk, vv in v.items() if kk not in ("ws", "fingerprints", "files")},
+                          "live": live(v), "hb_age_s": round(now - v["last_hb"], 1)}
+                      for k, v in nodes.items()}}
+
+
+@app.get("/inventory")
+def inventory():
+    """Audit what each node holds against the manifest recorded at slice time. The coordinator holds
+    no layer weights, so ground truth is the manifest's content hashes, not files on this disk."""
+    man = json.load(open(f"{ARGS.shards}/manifest.json"))
+    truth = {int(k): v for k, v in man["layer_hashes"].items()}
+    out, claimed, problems = {}, [], []
+    for name, n in nodes.items():
+        if not live(n):
+            continue
+        got = {int(k): v for k, v in (n.get("fingerprints") or {}).items()}
+        a, b = n["layers"]
+        wrong = [i for i, h in got.items() if truth.get(i) != h]
+        out[name] = {"layers": [a, b], "n_layers": b - a, "rss_mb": n.get("rss_mb"),
+                     "shard_dir": n.get("shard_dir"),
+                     "layer_files_present": sum(1 for f in n.get("files", []) if f.startswith("layer_")),
+                     "files": n.get("files", []),
+                     "fingerprints_verified": len(got) - len(wrong), "fingerprints_wrong": wrong,
+                     "layer_hashes": {str(k): v for k, v in sorted(got.items())},
+                     "holds_embedding_or_head": any(f.startswith("head") for f in n.get("files", []))}
+        claimed += list(range(a, b))
+        if set(got) != set(range(a, b)):
+            problems.append(f"{name}: fingerprints {sorted(got)} != claimed range {a}-{b-1}")
+        if wrong:
+            problems.append(f"{name}: layers {wrong} do not match the real shard files")
+        if out[name]["layer_files_present"] > b - a:
+            problems.append(f"{name}: has {out[name]['layer_files_present']} layer files but only owns {b-a}")
+    dupes = sorted({i for i in claimed if claimed.count(i) > 1})
+    if dupes:
+        problems.append(f"layers held by more than one node: {dupes}")
+    missing = sorted(set(range(cfg.n_layers)) - set(claimed))
+    coord_layers = [f for f in os.listdir(ARGS.shards) if f.startswith("layer_")]
+    if coord_layers:
+        problems.append(f"coordinator itself holds {len(coord_layers)} layer files")
+    return {"n_layers": cfg.n_layers, "coordinator_holds_layers": len(coord_layers),
+            "nodes": out, "duplicated_layers": dupes,
+            "unclaimed_layers": missing, "problems": problems,
+            "disjoint_and_complete": not problems and not dupes and not missing}
 
 
 @app.get("/events")
@@ -219,5 +456,13 @@ def index():
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"\n  LOBBY CODE: {ARGS.code}   expecting {ARGS.expected} nodes for {cfg.n_layers} layers\n")
+    try:
+        import segno
+        print()
+        segno.make(join_url(), error="m").terminal(compact=True)   # writes to stdout, returns None
+    except ImportError:
+        print("\n  (pip install segno to print a scannable join code here)")
+    print(f"  SCAN TO JOIN, or open:  {join_url()}")
+    print(f"\n  LOBBY CODE: {ARGS.code}   expecting {ARGS.expected} nodes for {cfg.n_layers} layers")
+    print(f"  telemetry: {'exporting to ' + ARGS.otlp if ARGS.otlp else 'off (set OTEL_EXPORTER_OTLP_ENDPOINT or --otlp)'}\n")
     uvicorn.run(app, host="0.0.0.0", port=ARGS.port, ws_max_size=None)

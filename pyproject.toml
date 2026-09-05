@@ -1,0 +1,39 @@
+[project]
+name = "dllm"
+version = "0.1.0"
+description = "One LLM split by layer across a Mac and phones. No device holds the whole model."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+    "torch",
+    "transformers",
+    "safetensors",
+    "huggingface_hub",
+    "numpy",
+    "fastapi[standard]",
+    "uvicorn",
+    "websockets",
+    "psutil",
+    "segno",          # the join QR the hub prints and serves; pure Python, MIT
+]
+
+[project.optional-dependencies]
+# The coordinator exports traces and metrics over OTLP to the proxy in observability/.
+observability = [
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
+]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["dllm"]
+
+[tool.pytest.ini_options]
+testpaths = ["dllm"]
+python_files = ["test_*.py"]

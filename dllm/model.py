@@ -45,6 +45,30 @@ def rope(x, pos, theta):
     return x * cos + rot * sin
 
 
+def sample(lg, temperature, top_p, top_k, seed=None):
+    """temperature 0 means greedy, which is what the verification scripts rely on.
+    top_k and top_p are applied in that order, matching what OpenAI clients expect. Ignoring them
+    silently would make this endpoint quietly disagree with any caller that sets them."""
+    if temperature <= 0:
+        return int(lg.argmax())
+    lg = lg / temperature
+    if top_k:
+        kth = lg.topk(min(top_k, lg.numel())).values[-1]
+        lg = lg.masked_fill(lg < kth, float("-inf"))
+    probs = torch.softmax(lg, -1)
+    if top_p and top_p < 1.0:
+        srt, idx = probs.sort(descending=True)
+        keep = (srt.cumsum(-1) - srt) < top_p          # keeps the token that crosses the mass too
+        mask = torch.zeros_like(probs, dtype=torch.bool)
+        mask[idx[keep]] = True
+        probs = probs * mask
+        probs = probs / probs.sum()
+    g = None
+    if seed is not None:
+        g = torch.Generator().manual_seed(seed)
+    return int(torch.multinomial(probs, 1, generator=g))
+
+
 class Layer(torch.nn.Module):
     def __init__(self, cfg: Cfg, w: dict):
         super().__init__()

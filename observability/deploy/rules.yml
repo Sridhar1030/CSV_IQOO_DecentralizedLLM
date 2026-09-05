@@ -54,3 +54,62 @@ groups:
           severity: warning
         annotations:
           summary: "No telemetry from {{ $labels.llmobs_node_id }} for 10 minutes"
+
+  # ------------------------------------------------------------------------------------------
+  # The dllm pipeline: one model split by layer across a Mac and phones. These metrics are emitted
+  # by the coordinator itself (namespaced dllm.*) and pass through the proxy untouched. Per-device
+  # readings on them are what each node reported about itself over its heartbeat.
+  # ------------------------------------------------------------------------------------------
+  - name: dllm-pipeline
+    interval: 15s
+    rules:
+      - record: dllm:hop_compute_p95:5m
+        expr: >
+          histogram_quantile(0.95,
+            sum by (le, dllm_node_name, dllm_hop_phase) (rate(dllm_hop_compute_seconds_bucket[5m])))
+
+      - record: dllm:hop_wire_p95:5m
+        expr: >
+          histogram_quantile(0.95,
+            sum by (le, dllm_node_name) (rate(dllm_hop_wire_seconds_bucket[5m])))
+
+      # Which device is the bottleneck: share of total per-token compute, by node.
+      - record: dllm:hop_compute_share:5m
+        expr: >
+          sum by (dllm_node_name) (rate(dllm_hop_compute_seconds_sum{dllm_hop_phase="decode"}[5m]))
+          / on() group_left
+          clamp_min(sum(rate(dllm_hop_compute_seconds_sum{dllm_hop_phase="decode"}[5m])), 1e-9)
+
+      - alert: DLLMPipelineIncomplete
+        expr: dllm_pipeline_complete == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "The layer pipeline has a gap: some layers are on no live node"
+          description: "Every chat request is being refused with 503 until a node holding the missing layers rejoins."
+
+      - alert: DLLMNodeDown
+        expr: dllm_node_up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.dllm_node_name }} stopped heartbeating"
+
+      - alert: DLLMNodeBatteryLow
+        expr: dllm_node_battery_ratio < 0.20
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.dllm_node_name }} is below 20% battery"
+          description: "A phone that dies mid-generation takes its layers with it. Move its range to another device or plug it in."
+
+      - alert: DLLMNodeMemoryPressure
+        expr: dllm_node_memory_system_utilization_ratio > 0.90
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.dllm_node_name }} is above 90% RAM, as reported by the device itself"

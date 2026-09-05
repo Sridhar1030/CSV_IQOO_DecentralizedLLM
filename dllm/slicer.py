@@ -1,7 +1,7 @@
 """Build step on a Mac: HF checkpoint -> shards/layer_XX.npz + head.npz + config.json.
 npz so a phone node needs only numpy, no safetensors/torch. Never runs on a node.
 python -m dllm.slicer Qwen/Qwen2.5-0.5B-Instruct shards"""
-import glob, json, os, shutil, sys
+import glob, hashlib, json, os, shutil, sys
 import numpy as np
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
@@ -9,6 +9,17 @@ from safetensors import safe_open
 
 def _np(t):
     return t.float().numpy() if t.dtype.is_floating_point else t.numpy()
+
+
+def content_hash(w):
+    """Hash the weights themselves, not the .npz container. np.savez stamps zip timestamps, so two
+    slicer runs produce different files for identical weights. This is stable across runs and
+    machines, which lets a coordinator that holds no layers still verify what a node reports."""
+    h = hashlib.sha256()
+    for k in sorted(w):
+        a = np.ascontiguousarray(w[k])
+        h.update(k.encode()); h.update(str(a.dtype).encode()); h.update(str(a.shape).encode()); h.update(a.tobytes())
+    return h.hexdigest()[:16]
 
 
 def slice_model(repo, out):
@@ -31,7 +42,9 @@ def slice_model(repo, out):
         np.savez(f"{out}/layer_{i:02d}.npz", **w)
     np.savez(f"{out}/head.npz", **head)
     files = {os.path.basename(p): os.path.getsize(p) for p in sorted(glob.glob(f"{out}/*.npz"))}
-    json.dump({"repo": repo, "n_layers": n_layers, "files": files}, open(f"{out}/manifest.json", "w"), indent=1)
+    hashes = {str(i): content_hash(w) for i, w in buckets.items()}
+    json.dump({"repo": repo, "n_layers": n_layers, "files": files, "layer_hashes": hashes},
+              open(f"{out}/manifest.json", "w"), indent=1)
     print(f"{n_layers} layer shards + head -> {out}  ({sum(files.values())/2**30:.2f} GB total)")
 
 
