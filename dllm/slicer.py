@@ -1,14 +1,45 @@
 """Build step on a Mac: HF checkpoint -> shards/layer_XX.npz + head.npz + config.json.
 npz so a phone node needs only numpy, no safetensors/torch. Never runs on a node.
-python -m dllm.slicer Qwen/Qwen2.5-0.5B-Instruct shards"""
-import glob, hashlib, json, os, shutil, sys
+
+python -m dllm.slicer Qwen/Qwen2.5-0.5B-Instruct shards
+python -m dllm.slicer Qwen/Qwen2.5-32B-Instruct dist --int8 --stream
+
+--int8 stores every projection as int8 with one fp32 scale per output row, a quarter of the
+bytes. --stream pulls one checkpoint file at a time and deletes it once no later layer needs it,
+so slicing a 65 GB checkpoint never needs 65 GB of free disk.
+"""
+import argparse, collections, glob, hashlib, json, os, shutil
 import numpy as np
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors import safe_open
+
+INDEX = "model.safetensors.index.json"
+SIDECAR = ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json",
+           "vocab.json", "merges.txt"]
 
 
 def _np(t):
     return t.float().numpy() if t.dtype.is_floating_point else t.numpy()
+
+
+def quantize(a):
+    """Symmetric int8 with one scale per output row. Rows are output channels, so a row with a
+    small dynamic range keeps its resolution however large the rest of the matrix is."""
+    a = np.ascontiguousarray(a, dtype=np.float32)
+    s = np.abs(a).max(axis=1) / 127.0
+    s[s == 0] = 1.0                                        # an all-zero row would divide by zero
+    q = np.rint(a / s[:, None]).clip(-127, 127).astype(np.int8)
+    return q, s.astype(np.float32)
+
+
+def put(out, key, a, int8):
+    """Store one tensor. 2D tensors are the projections, the embedding and lm_head, and are the
+    only ones worth quantising; norms and biases are 1D and stay fp32."""
+    if int8 and a.ndim == 2:
+        q, s = quantize(a)
+        out[key], out[f"{key}.scale"] = q, s
+    else:
+        out[key] = np.ascontiguousarray(a, dtype=np.float32)
 
 
 def content_hash(w):
@@ -22,31 +53,113 @@ def content_hash(w):
     return h.hexdigest()[:16]
 
 
-def slice_model(repo, out):
-    src = snapshot_download(repo, allow_patterns=["*.json", "*.safetensors", "merges.txt", "vocab.json"])
+class Checkpoint:
+    """Reads tensors by name out of an HF checkpoint, fetching each file the first time it is
+    asked for. With `stream`, a file is deleted as soon as no later step needs it, which keeps
+    peak disk at the output plus the couple of checkpoint files still in play."""
+
+    def __init__(self, repo, stream):
+        self.repo, self.stream, self.open_files = repo, stream, {}
+        try:
+            self.weight_map = json.load(open(hf_hub_download(repo, INDEX)))["weight_map"]
+        except Exception:                                   # small models ship one unsharded file
+            self.weight_map = None
+        self.last_use = {}
+
+    def file_of(self, key):
+        return self.weight_map[key] if self.weight_map else "model.safetensors"
+
+    def plan(self, steps):
+        """steps: list of (name, layer, [tensor keys]). Records, per checkpoint file, the last step
+        that reads it, so `release` knows when the file can go."""
+        for i, (_, _, keys) in enumerate(steps):
+            for k in keys:
+                self.last_use[self.file_of(k)] = i
+
+    def get(self, key):
+        f = self.file_of(key)
+        if f not in self.open_files:
+            self.open_files[f] = safe_open(hf_hub_download(self.repo, f), "pt")
+        return _np(self.open_files[f].get_tensor(key))
+
+    def release(self, step):
+        if not self.stream:
+            return
+        for f, last in list(self.last_use.items()):
+            if last != step:
+                continue
+            self.open_files.pop(f, None)
+            try:
+                p = hf_hub_download(self.repo, f)
+                os.unlink(os.path.realpath(p))
+                if os.path.islink(p):
+                    os.unlink(p)
+            except OSError:
+                pass
+            self.last_use.pop(f, None)
+
+
+def slice_model(repo, out, int8=False, stream=False):
     os.makedirs(out, exist_ok=True)
-    for f in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "vocab.json", "merges.txt"]:
-        if os.path.exists(f"{src}/{f}"):
-            shutil.copy(f"{src}/{f}", out)
-    n_layers = json.load(open(f"{src}/config.json"))["num_hidden_layers"]
-    buckets, head = {i: {} for i in range(n_layers)}, {}
-    for path in sorted(glob.glob(f"{src}/*.safetensors")):
-        with safe_open(path, "pt") as f:
-            for k in f.keys():
-                if k.startswith("model.layers."):
-                    i = int(k.split(".")[2])
-                    buckets[i][k.split(f"model.layers.{i}.")[1]] = _np(f.get_tensor(k))
-                else:
-                    head[k] = _np(f.get_tensor(k))
-    for i, w in buckets.items():
-        np.savez(f"{out}/layer_{i:02d}.npz", **w)
-    np.savez(f"{out}/head.npz", **head)
+    if stream:
+        for f in SIDECAR:
+            try:
+                shutil.copy(hf_hub_download(repo, f), out)
+            except Exception:
+                pass
+    else:
+        src = snapshot_download(repo, allow_patterns=["*.json", "*.safetensors", "merges.txt", "vocab.json"])
+        for f in SIDECAR:
+            if os.path.exists(f"{src}/{f}"):
+                shutil.copy(f"{src}/{f}", out)
+    n_layers = json.load(open(f"{out}/config.json"))["num_hidden_layers"]
+
+    ck = Checkpoint(repo, stream)
+    if ck.weight_map:
+        keys = list(ck.weight_map)
+    else:
+        with safe_open(hf_hub_download(repo, "model.safetensors"), "pt") as f:
+            keys = list(f.keys())
+    per_layer = collections.defaultdict(list)
+    head_keys = []
+    for k in keys:
+        if k.startswith("model.layers."):
+            per_layer[int(k.split(".")[2])].append(k)
+        else:
+            head_keys.append(k)
+
+    # The head first: it reads the checkpoint's first and last file, and getting it out of the way
+    # lets those files be released as the layers march past them.
+    steps = [("head", None, head_keys)] + [(f"layer_{i:02d}", i, per_layer[i]) for i in range(n_layers)]
+    ck.plan(steps)
+
+    hashes = {}
+    for step, (name, layer, ks) in enumerate(steps):
+        w = {}
+        for k in ks:
+            short = k if layer is None else k.split(f"model.layers.{layer}.", 1)[1]
+            put(w, short, ck.get(k), int8)
+        np.savez(f"{out}/{name}.npz", **w)
+        if layer is not None:
+            hashes[str(layer)] = content_hash(w)
+        del w
+        ck.release(step)
+        print(f"  {name}.npz  {os.path.getsize(f'{out}/{name}.npz')/2**20:.0f} MB", flush=True)
+
     files = {os.path.basename(p): os.path.getsize(p) for p in sorted(glob.glob(f"{out}/*.npz"))}
-    hashes = {str(i): content_hash(w) for i, w in buckets.items()}
-    json.dump({"repo": repo, "n_layers": n_layers, "files": files, "layer_hashes": hashes},
+    json.dump({"repo": repo, "n_layers": n_layers, "quant": "int8" if int8 else "fp32",
+               "files": files, "layer_hashes": hashes},
               open(f"{out}/manifest.json", "w"), indent=1)
     print(f"{n_layers} layer shards + head -> {out}  ({sum(files.values())/2**30:.2f} GB total)")
 
 
 if __name__ == "__main__":
-    slice_model(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "shards")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("repo")
+    ap.add_argument("out", nargs="?", default="shards")
+    ap.add_argument("--int8", action="store_true", help="store projections as int8 with per-row scales")
+    ap.add_argument("--stream", action="store_true",
+                    help="fetch one checkpoint file at a time and delete it once no later layer "
+                         "needs it, so peak disk stays near the size of the output")
+    a = ap.parse_args()
+    slice_model(a.repo, a.out, int8=a.int8, stream=a.stream)

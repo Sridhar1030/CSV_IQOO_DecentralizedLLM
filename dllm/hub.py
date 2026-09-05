@@ -59,8 +59,10 @@ MODEL_NAME = (json.load(open(f"{ARGS.shards}/manifest.json")).get("repo", "dllm"
 
 
 def _layer_bytes() -> int:
-    """fp32 bytes of one layer shard, the unit the RAM planner works in. The manifest records file
-    sizes at slice time, so the hub knows this without holding any layer itself."""
+    """Bytes of one layer shard, the unit the RAM planner works in. The manifest records file sizes
+    at slice time, so the hub knows this without holding any layer itself. For an int8 shard this
+    is also what a torch node keeps resident, since the weights stay int8; a numpy node dequantises
+    on load and costs four times this."""
     man = f"{ARGS.shards}/manifest.json"
     if os.path.exists(man):
         files = json.load(open(man)).get("files", {})

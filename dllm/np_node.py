@@ -51,6 +51,20 @@ def softmax(x):
     return e / e.sum(-1, keepdims=True)
 
 
+def dequant(z):
+    """Weights out of a shard, whichever way the slicer wrote it. An int8 shard carries one fp32
+    scale per output row alongside each quantised tensor; numpy has no int8 matmul worth using, so
+    a numpy node spends the memory back at load time and runs fp32. The download is still a
+    quarter of the size, which is the part a phone on wifi actually feels."""
+    w = {}
+    for k in z.files:
+        if k.endswith(".scale"):
+            continue
+        s = f"{k}.scale"
+        w[k] = z[k].astype(np.float32) * z[s][:, None] if s in z.files else z[k].astype(np.float32)
+    return w
+
+
 class Layer:
     def __init__(self, cfg, w):
         self.c = cfg
@@ -93,7 +107,7 @@ class Shard:
         self.layers = []
         for i in range(a, b):
             with np.load(f"{shard_dir}/layer_{i:02d}.npz") as z:
-                self.layers.append(Layer(cfg, {k: z[k].astype(np.float32) for k in z.files}))
+                self.layers.append(Layer(cfg, dequant(z)))
         self.cache = {}
 
     def __call__(self, x, pos, req="default"):

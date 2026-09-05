@@ -186,8 +186,9 @@ def test_hysteresis_blocks_tiny_gain():
     assert ok and "gain 40% >= 15%" in why
     ok, why = P.should_apply(100, 140, 400, True, True, 0, 100, False, False)
     assert not ok and any(s.startswith("payback") and ">" in s for s in why)
-    ok, why = P.should_apply(100, 140, 20, True, True, 90, 100, False, False)
-    assert not ok and any(s.startswith("cooldown 20") for s in why)
+    recent = 100 - P.COOLDOWN_S + 2                    # applied recently enough that 2 s are left
+    ok, why = P.should_apply(100, 140, 20, True, True, recent, 100, False, False)
+    assert not ok and any(s.startswith("cooldown 2 s left") for s in why)
     assert P.should_apply(100, 140, 20, True, False, 0, 100, False, False) == (False, ["no change"])
     assert P.should_apply(100, 101, 999, True, True, 99, 100, False, True) == (True, ["forced"])
     assert P.should_apply(None, 140, 20, False, True, 0, 100, False, False)[0]

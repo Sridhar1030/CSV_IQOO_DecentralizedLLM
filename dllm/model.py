@@ -12,6 +12,36 @@ def load_npz(path):
         return {k: torch.from_numpy(z[k]) for k in z.files}
 
 
+def _q(w, key):
+    """(weight, scales) for `key`: int8 plus one fp32 scale per output row when the slicer
+    quantised this shard, fp32 and None when it did not. Both shard kinds load the same way."""
+    t = w[key]
+    if t.dtype == torch.int8:
+        return t, w[f"{key}.scale"].float()
+    return t.float(), None
+
+
+class QLinear(torch.nn.Module):
+    """F.linear over an int8 weight with per-output-row scales, or a plain fp32 one.
+
+    Weight-only quantisation: activations stay fp32, so nothing upstream changes. int8 is not
+    only a quarter of the bytes, it is also faster here, because a decode step is bound by how
+    fast the weights can be read, not by the arithmetic over them."""
+
+    def __init__(self, w, scale, bias):
+        super().__init__()
+        self.register_buffer("weight", w, persistent=False)
+        self.register_buffer("scale", scale, persistent=False)
+        self.register_buffer("bias", bias, persistent=False)
+
+    def forward(self, x):
+        if self.scale is None:
+            return F.linear(x, self.weight, self.bias)
+        y = torch.ops.aten._weight_int8pack_mm(x.reshape(-1, x.shape[-1]).contiguous(), self.weight, self.scale)
+        y = y.view(*x.shape[:-1], -1)
+        return y if self.bias is None else y + self.bias
+
+
 class Cfg:
     def __init__(self, d):
         self.hidden = d["hidden_size"]
@@ -74,13 +104,12 @@ class Layer(torch.nn.Module):
         super().__init__()
         self.cfg = cfg
         g = lambda k: torch.nn.Parameter(w[k].float(), requires_grad=False)
+        lin = lambda k: QLinear(*_q(w, f"{k}.weight"), w[f"{k}.bias"].float() if f"{k}.bias" in w else None)
         self.ln1 = g("input_layernorm.weight")
         self.ln2 = g("post_attention_layernorm.weight")
-        self.wq, self.bq = g("self_attn.q_proj.weight"), g("self_attn.q_proj.bias")
-        self.wk, self.bk = g("self_attn.k_proj.weight"), g("self_attn.k_proj.bias")
-        self.wv, self.bv = g("self_attn.v_proj.weight"), g("self_attn.v_proj.bias")
-        self.wo = g("self_attn.o_proj.weight")
-        self.wg, self.wu, self.wd = g("mlp.gate_proj.weight"), g("mlp.up_proj.weight"), g("mlp.down_proj.weight")
+        self.q, self.k, self.v = lin("self_attn.q_proj"), lin("self_attn.k_proj"), lin("self_attn.v_proj")
+        self.o = lin("self_attn.o_proj")
+        self.gate, self.up, self.down = lin("mlp.gate_proj"), lin("mlp.up_proj"), lin("mlp.down_proj")
 
     def forward(self, x, pos, past_k=None, past_v=None):
         """x: (1, n, hidden) fp32. pos: (n,) int64 absolute positions.
@@ -88,9 +117,9 @@ class Layer(torch.nn.Module):
         c = self.cfg
         b, n, _ = x.shape
         h = rms_norm(x, self.ln1, c.eps)
-        q = F.linear(h, self.wq, self.bq).view(b, n, c.heads, c.head_dim).transpose(1, 2)
-        k = F.linear(h, self.wk, self.bk).view(b, n, c.kv_heads, c.head_dim).transpose(1, 2)
-        v = F.linear(h, self.wv, self.bv).view(b, n, c.kv_heads, c.head_dim).transpose(1, 2)
+        q = self.q(h).view(b, n, c.heads, c.head_dim).transpose(1, 2)
+        k = self.k(h).view(b, n, c.kv_heads, c.head_dim).transpose(1, 2)
+        v = self.v(h).view(b, n, c.kv_heads, c.head_dim).transpose(1, 2)
         q, k = rope(q, pos, c.theta), rope(k, pos, c.theta)
         if past_k is not None:
             k, v = torch.cat([past_k, k], 2), torch.cat([past_v, v], 2)
@@ -102,9 +131,9 @@ class Layer(torch.nn.Module):
         att = (q @ kk.transpose(-1, -2)) / math.sqrt(c.head_dim)
         att = att.masked_fill(~mask, float("-inf")).softmax(-1)
         o = (att @ vv).transpose(1, 2).reshape(b, n, c.hidden)
-        x = x + F.linear(o, self.wo)
+        x = x + self.o(o)
         h = rms_norm(x, self.ln2, c.eps)
-        x = x + F.linear(F.silu(F.linear(h, self.wg)) * F.linear(h, self.wu), self.wd)
+        x = x + self.down(F.silu(self.gate(h)) * self.up(h))
         return x, k, v
 
     def forward_batch(self, x, positions, past):
@@ -122,9 +151,9 @@ class Layer(torch.nn.Module):
         c = self.cfg
         B = x.shape[0]
         h = rms_norm(x, self.ln1, c.eps)                                   # (B, 1, H)
-        q = F.linear(h, self.wq, self.bq).view(B, 1, c.heads, c.head_dim).transpose(1, 2)
-        k = F.linear(h, self.wk, self.bk).view(B, 1, c.kv_heads, c.head_dim).transpose(1, 2)
-        v = F.linear(h, self.wv, self.bv).view(B, 1, c.kv_heads, c.head_dim).transpose(1, 2)
+        q = self.q(h).view(B, 1, c.heads, c.head_dim).transpose(1, 2)
+        k = self.k(h).view(B, 1, c.kv_heads, c.head_dim).transpose(1, 2)
+        v = self.v(h).view(B, 1, c.kv_heads, c.head_dim).transpose(1, 2)
 
         rep_ = c.heads // c.kv_heads
         out = x.new_empty(B, 1, c.hidden)
@@ -142,9 +171,9 @@ class Layer(torch.nn.Module):
             att = att.softmax(-1)                                           # one query, all keys: no mask needed
             out[i] = (att @ vi.repeat_interleave(rep_, 1)).transpose(1, 2).reshape(1, 1, c.hidden)
 
-        x = x + F.linear(out, self.wo)
+        x = x + self.o(out)
         h = rms_norm(x, self.ln2, c.eps)
-        x = x + F.linear(F.silu(F.linear(h, self.wg)) * F.linear(h, self.wu), self.wd)
+        x = x + self.down(F.silu(self.gate(h)) * self.up(h))
         return x, new_cache
 
 
@@ -199,15 +228,22 @@ class Head(torch.nn.Module):
         super().__init__()
         w = load_npz(f"{shard_dir}/head.npz")
         self.cfg, self.device_ = cfg, device
-        self.embed = w["model.embed_tokens.weight"].float().to(device)
+        e, es = _q(w, "model.embed_tokens.weight")
+        self.embed = e.to(device)
+        self.embed_scale = None if es is None else es.to(device)
         self.norm = w["model.norm.weight"].float().to(device)
-        self.lm_head = w.get("lm_head.weight", w["model.embed_tokens.weight"]).float().to(device)
+        hk = "lm_head.weight" if "lm_head.weight" in w else "model.embed_tokens.weight"
+        self.lm_head = QLinear(*_q(w, hk), None).to(device)
 
     @torch.no_grad()
     def embed_tokens(self, ids):
-        return self.embed[torch.as_tensor(ids, device=self.device_)][None]
+        ids = torch.as_tensor(ids, device=self.device_)
+        rows = self.embed[ids]
+        if self.embed_scale is None:
+            return rows[None]
+        return (rows.float() * self.embed_scale[ids][:, None])[None]
 
     @torch.no_grad()
     def logits(self, x):
         x = rms_norm(x.to(self.device_)[:, -1], self.norm, self.cfg.eps)
-        return F.linear(x, self.lm_head)[0]
+        return self.lm_head(x)[0]
