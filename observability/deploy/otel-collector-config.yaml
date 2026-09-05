@@ -1,0 +1,87 @@
+# OpenTelemetry Collector (Apache-2.0) - the fan-out point of the stack.
+# Nodes speak OTLP to here; here fans out to Jaeger (traces) and Prometheus
+# (metrics). Swapping a backend later is a change to this file only, never a
+# change to application code.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Bounds the collector's own RAM so it cannot become the thing that OOMs
+  # the box it is meant to be observing.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  # Stamp everything with which collector handled it.
+  resource:
+    attributes:
+      - key: collector.name
+        value: llmobs-collector
+        action: upsert
+
+exporters:
+  # --- traces -> Jaeger over OTLP ------------------------------------
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # --- metrics -> scraped by Prometheus ------------------------------
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Deliberately OFF. Promoting resource attributes to metric labels lets a
+    # relay's own resource overwrite same-named data-point attributes - so
+    # every edge node's tokens end up labelled with the ingest server's node
+    # id instead of their own. llmobs already puts llmobs.node.id and
+    # llmobs.node.role on every data point, so this conversion buys nothing
+    # and costs correctness.
+    resource_to_telemetry_conversion:
+      enabled: false
+    # Nodes in a decentralized mesh come and go. The exporter keeps serving a
+    # departed node's last values until they expire, so a dead node looks
+    # alive for this long. Shorten it for a fleet that churns fast; lengthen
+    # it if your Prometheus scrape interval is long.
+    metric_expiration: 2m
+    # Keep the OTLP start timestamp so Prometheus sees a counter reset when a
+    # node restarts, instead of reading the drop as a negative rate.
+    enable_open_metrics: true
+
+  # Uncomment when a node's telemetry is not showing up.
+  # debug:
+  #   verbosity: detailed
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      # Defaults to localhost:8888, which inside a container only binds
+      # loopback - Prometheus in another container cannot reach it and the
+      # scrape target sits permanently "down". Bind all interfaces instead.
+      address: 0.0.0.0:8888

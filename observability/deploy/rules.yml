@@ -1,0 +1,56 @@
+# Alerting/recording rules for a decentralized LLM fleet.
+groups:
+  - name: llmobs-nodes
+    interval: 30s
+    rules:
+      # --- recording rules: the queries you actually want on a dashboard ---
+      - record: llmobs:tokens_per_second:rate5m
+        expr: sum by (llmobs_node_id, gen_ai_token_type) (rate(llmobs_tokens_total[5m]))
+
+      - record: llmobs:request_latency_p95:5m
+        expr: >
+          histogram_quantile(0.95,
+            sum by (le, llmobs_node_id, gen_ai_request_model)
+              (rate(gen_ai_client_operation_duration_seconds_bucket[5m])))
+
+      - record: llmobs:error_ratio:5m
+        expr: >
+          sum by (llmobs_node_id) (rate(llmobs_requests_total{outcome="error"}[5m]))
+          /
+          clamp_min(sum by (llmobs_node_id) (rate(llmobs_requests_total[5m])), 1e-9)
+
+      # --- alerts ---------------------------------------------------------
+      - alert: LLMNodeMemoryPressure
+        expr: llmobs_system_memory_utilization_ratio > 0.90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.llmobs_node_id }} is above 90% RAM"
+          description: "An inference node this close to the limit will start swapping or get OOM-killed mid-generation."
+
+      - alert: LLMRequestLatencyHigh
+        expr: llmobs:request_latency_p95:5m > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 30s on {{ $labels.llmobs_node_id }}"
+
+      - alert: LLMNodeErrorRate
+        expr: llmobs:error_ratio:5m > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.llmobs_node_id }} is failing more than 5% of requests"
+
+      - alert: LLMNodeSilent
+        # A node that stops reporting is usually a node that stopped working.
+        expr: >
+          (time() - max by (llmobs_node_id) (timestamp(llmobs_requests_total))) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No telemetry from {{ $labels.llmobs_node_id }} for 10 minutes"

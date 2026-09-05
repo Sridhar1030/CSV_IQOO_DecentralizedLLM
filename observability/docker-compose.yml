@@ -1,0 +1,90 @@
+# llmobs observability stack.
+#
+# Every component here is Apache-2.0. Grafana is deliberately not included:
+# Grafana, Loki and Tempo moved to AGPLv3 in 2021, which is not a permissive
+# license. Jaeger's UI covers trace exploration and Prometheus' own UI covers
+# metric queries; see README for how to add Grafana if AGPL is acceptable.
+
+name: llmobs
+
+services:
+  # ---------------------------------------------------------------
+  # The endpoint: OTLP proxy. Apps export here instead of the Collector.
+  #   OTEL_EXPORTER_OTLP_ENDPOINT=http://llmobs:8100
+  #
+  # Runs as a sidecar/agent on each device in production - it stamps spans
+  # with the RAM of the machine IT runs on, so a central deployment would
+  # report its own memory rather than the inference node's.
+  # ---------------------------------------------------------------
+  llmobs:
+    build: .
+    container_name: llmobs
+    ports:
+      - "8100:8100"
+    environment:
+      LLMOBS_SERVICE_NAME: llmobs-proxy
+      LLMOBS_NODE_ROLE: proxy
+      LLMOBS_UPSTREAM_ENDPOINT: http://otel-collector:4318
+      LLMOBS_EXPORT_INTERVAL_MS: "5000"
+      # Set a value here to require X-API-Key on the OTLP endpoints.
+      LLMOBS_API_KEY: ""
+    depends_on:
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # OpenTelemetry Collector (Apache-2.0)
+  # ---------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: otel-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./deploy/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC  - for nodes exporting directly
+      - "4318:4318"   # OTLP HTTP  - for nodes exporting directly
+      - "8889:8889"   # Prometheus exposition
+      - "13133:13133" # health_check
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # Jaeger (Apache-2.0) - trace storage + UI
+  # ---------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # In-memory storage: fine for dev, swap for Cassandra/Elasticsearch
+      # (both permissively licensed) before relying on it.
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: "100000"
+    ports:
+      - "16686:16686" # Jaeger UI
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # Prometheus (Apache-2.0) - metric storage + UI
+  # ---------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:

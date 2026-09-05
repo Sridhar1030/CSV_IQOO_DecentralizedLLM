@@ -1,0 +1,24 @@
+# Prometheus (Apache-2.0) scrape config.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    stack: llmobs
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  # Metrics that the OTel Collector re-exposes in Prometheus format.
+  - job_name: llmobs-collector
+    # The OTel exporter already sets job/instance from service.name and
+    # service.instance.id. honor_labels keeps those instead of renaming them
+    # to exported_job / exported_instance.
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # The collector's own internal health metrics.
+  - job_name: otel-collector-internal
+    static_configs:
+      - targets: ["otel-collector:8888"]
