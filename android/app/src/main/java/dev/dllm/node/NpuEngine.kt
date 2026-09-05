@@ -24,6 +24,14 @@ class NpuEngine(private val pluginDir: String, private val cacheDir: String) : E
     override val name = "npu-htp"
     override val shardExt = "tflite"
 
+    /** Resident cost of one layer, estimated from its graph file. Measured on the iQOO: a 14B layer
+     *  whose fp16 graph is 525 MB occupies about 2.4 GB once the HTP context and the runtime's own
+     *  copies are counted, and a 0.5B layer scales the same way, so the file size times [RESIDENT]
+     *  is a fair bound. Reported to the hub so the planner never assigns more layers than fit. */
+    override val bytesPerLayer: Long? get() = lastLayerBytes
+
+    @Volatile private var lastLayerBytes: Long? = null
+
     private var env = 0L
     private lateinit var cfg: ModelConfig
     private var a = 0
@@ -41,8 +49,11 @@ class NpuEngine(private val pluginDir: String, private val cacheDir: String) : E
             env = NpuNative.nativeInit(pluginDir, cacheDir)
             require(env != 0L) { "LiteRT NPU environment failed to initialise" }
         }
+        var bytes = 0L
         for (i in a until b) {
-            val path = File(dir, "layer_%02d.tflite".format(i)).absolutePath
+            val f = File(dir, "layer_%02d.tflite".format(i))
+            bytes = maxOf(bytes, f.length())
+            val path = f.absolutePath
             val h = NpuNative.nativeCreate(env, path)
             require(h != 0L) { "NPU compile failed for $path" }
             handles.add(h)
@@ -52,7 +63,9 @@ class NpuEngine(private val pluginDir: String, private val cacheDir: String) : E
         // Cache length is whatever the graph was built with: kv_cache_k_0 is [1, kvHeads, headDim, S].
         val kIdx = inNames[0].indexOf("kv_cache_k_0")
         if (kIdx >= 0) cacheLen = kSizeToCacheLen()
-        Log.i("dllm", "NpuEngine loaded layers $a-${b - 1}, cache $cacheLen")
+        lastLayerBytes = if (bytes > 0) (bytes * RESIDENT).toLong() else null
+        Log.i("dllm", "NpuEngine loaded layers $a-${b - 1}, cache $cacheLen, " +
+                "${bytes / 1048576} MB/graph -> ~${(lastLayerBytes ?: 0) / 1048576} MB resident/layer")
     }
 
     private fun kSizeToCacheLen(): Int = cacheLen  // fixed by the exporter (512); kept for clarity
@@ -136,5 +149,10 @@ class NpuEngine(private val pluginDir: String, private val cacheDir: String) : E
         return out
     }
 
-    private companion object { const val MASK_FILL = -1e4f }
+    private companion object {
+        const val MASK_FILL = -1e4f
+        /** Resident bytes per byte of graph file, measured on the iQOO: a 525 MB fp16 graph for a
+         *  14B layer occupied ~2.4 GB with its HTP context. */
+        const val RESIDENT = 4.6
+    }
 }

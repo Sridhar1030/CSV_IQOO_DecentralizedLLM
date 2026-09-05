@@ -19,6 +19,8 @@ mac_shards/
 hub_shards/
 tail_shards/
 mac2_shards/
+mac14/
+mac05/
 dist*/
 *.npz
 *.safetensors

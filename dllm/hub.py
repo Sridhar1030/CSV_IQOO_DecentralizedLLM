@@ -25,6 +25,27 @@ ap.add_argument("--utilization", type=float, default=float(os.getenv("UTILIZATIO
 ap.add_argument("--min-layers", type=int, default=placement.MIN_LAYERS,
                 help="a node holding fewer layers than this is not worth its wire hops")
 ap.add_argument("--min-nodes", type=int, default=None, help="force at least this many nodes into the pipeline (demos)")
+ap.add_argument("--phone-memory-cap", type=float, default=None, metavar="GB",
+                help="ceiling on the memory the planner may spend on a phone, whatever the phone "
+                     "reports it has. The Android app has no command line of its own, so this is "
+                     "the phone's equivalent of the node's --memory-cap. Applies to any node whose "
+                     "device says android. Note this bounds the BUDGET the planner divides up; it "
+                     "is not enforced on the phone, so set it to what the phone can really spare.")
+ap.add_argument("--memory-cap", action="append", default=[], metavar="NAME=GB",
+                help="per-node ceiling, repeatable, e.g. --memory-cap I2501-f6b7=6. Overrides "
+                     "--phone-memory-cap for that node. NAME is the node name the hub shows in "
+                     "/status. Use it when two phones have different amounts to spare.")
+ap.add_argument("--replan-delay", type=float, default=None, metavar="S",
+                help="seconds to wait after a node joins or leaves before planning. The planner "
+                     "itself takes well under a millisecond; this delay exists only to absorb a "
+                     "burst of nodes arriving together so they are placed in one plan instead of "
+                     "several. Lower it (0 is allowed) for a small cluster where you want a join "
+                     "acted on at once. Default: 2s on join, 3s on leave.")
+ap.add_argument("--npu-layer-bytes", type=int, default=None, metavar="BYTES",
+                help="what the planner assumes one layer costs a node running the Hexagon NPU "
+                     "engine. 0 removes the NPU cap entirely: the phone is then sized from the "
+                     "shard like every other node, and whatever it reports about itself is "
+                     "ignored. Default: measured from the layer_00.tflite this hub serves.")
 ap.add_argument("--concurrency", type=int, default=0,
                 help="design point. 0 = follow the observed in-flight EMA, N = plan for N concurrent requests")
 ap.add_argument("--port", type=int, default=8000)
@@ -76,6 +97,79 @@ def _layer_bytes() -> int:
 
 
 LAYER_BYTES = _layer_bytes()
+
+
+def _npu_layer_bytes():
+    """What one layer costs a node running the Hexagon NPU engine, which is a different number
+    entirely. That node fetches layer_XX.tflite, not .npz: the graph carries fp16 weights rather
+    than int4, and the HTP context and the runtime's own copies sit on top of it. Measured on an
+    iQOO I2501, a 14B layer whose fp16 graph is 525 MB occupied ~2.4 GB.
+
+    The hub has to supply this because the node cannot: the planner sizes a phone on its very first
+    hello, before it has downloaded a graph or read the config, so it has nothing to measure yet.
+    Sized once here from the graph the hub itself serves."""
+    for d in (ARGS.dist, ARGS.shards):
+        if d and os.path.exists(f"{d}/layer_00.tflite"):
+            return int(os.path.getsize(f"{d}/layer_00.tflite") * 4.6)
+    return None
+
+
+NPU_LAYER_BYTES = _npu_layer_bytes()
+
+
+def _memory_caps():
+    """--memory-cap NAME=GB, parsed once. Bad entries are refused loudly rather than ignored: a
+    silently dropped cap would look like the cap was applied and did nothing."""
+    out = {}
+    for item in ARGS.memory_cap:
+        name, _, gb = item.partition("=")
+        if not _ or not name.strip():
+            raise SystemExit(f"--memory-cap wants NAME=GB, got {item!r}")
+        try:
+            out[name.strip()] = float(gb)
+        except ValueError:
+            raise SystemExit(f"--memory-cap {item!r}: {gb!r} is not a number of GB")
+    return out
+
+
+MEMORY_CAPS = _memory_caps()
+
+
+def _capped_ram(name, device, ram_gb):
+    """The memory budget the planner may spend on this node.
+
+    A node that owns its command line caps itself (dllm.node --memory-cap) and reports the capped
+    figure here already. A phone cannot: the Android app takes no arguments, so its ceiling has to
+    be imposed from this side. --memory-cap NAME=GB wins over --phone-memory-cap so one phone can
+    be held back without touching the other.
+
+    This bounds what the PLANNER hands out. Nothing on the phone enforces it, so a cap set above
+    what the device can really spare still ends in the low-memory killer."""
+    cap = MEMORY_CAPS.get(name)
+    if cap is None and ARGS.phone_memory_cap and "android" in (device or ""):
+        cap = ARGS.phone_memory_cap
+    if cap is None or ram_gb is None:
+        return ram_gb
+    return round(min(float(ram_gb), float(cap)), 1)
+
+
+def _set_bytes_per_layer(n, hdr):
+    """Record what one layer costs this node, which is what the planner sizes it by.
+
+    Normally the node knows best and says so, and only an NPU node that has measured nothing yet
+    falls back to the hub's estimate. --npu-layer-bytes overrides that for NPU nodes: a positive
+    value forces the figure, and 0 drops the NPU special case altogether so a phone is planned from
+    the shard size like any other node, ignoring what it reports about itself. Setting 0 lets a
+    phone take as many layers as the shard maths allows, which is the point of being able to say
+    it -- the cap exists because the measured cost was ~2.4 GB a layer, so removing it means
+    trusting a different number, not that the memory stopped being spent."""
+    is_npu = "npu" in (n.get("device") or "")
+    if is_npu and ARGS.npu_layer_bytes is not None:
+        n["bytes_per_layer"] = ARGS.npu_layer_bytes or None
+    elif hdr.get("bytes_per_layer"):
+        n["bytes_per_layer"] = int(hdr["bytes_per_layer"])
+    elif is_npu and NPU_LAYER_BYTES:
+        n["bytes_per_layer"] = NPU_LAYER_BYTES
 HB_TIMEOUT = 5.0  # a node that has not sent a heartbeat this recently is treated as gone
 MAX_BATCH = placement.MAX_BATCH
 
@@ -171,14 +265,55 @@ def _fmt(assignments) -> str:
     return ", ".join(f"{m} {a}-{b - 1}" for m, (a, b) in sorted(assignments.items(), key=lambda kv: kv[1][0]))
 
 
+def _rng(r) -> str:
+    return f"{r[0]}-{r[1] - 1}" if r else "-"
+
+
+def _diff(before, after) -> str:
+    """One line per node saying what this plan actually changes: kept, moved, joined or dropped.
+
+    The applied line alone shows the destination, which reads the same whether a node was left
+    untouched or had its whole range swapped out from under it. During a reassignment the old and
+    new ranges both exist for a moment, and without the before-and-after it looks like two nodes
+    own the same layer. Naming the transition is what tells those apart."""
+    out = []
+    for m in sorted(set(before) | set(after), key=lambda m: (after.get(m) or before.get(m) or [0])[0]):
+        b, a = before.get(m), after.get(m)
+        if b == a:
+            out.append(f"{m} {_rng(a)} kept")
+        elif b is None:
+            out.append(f"{m} {_rng(a)} NEW")
+        elif a is None:
+            out.append(f"{m} {_rng(b)} DROPPED")
+        else:
+            out.append(f"{m} {_rng(b)} -> {_rng(a)}")
+    return ", ".join(out)
+
+
+def _coverage(assignments, n_layers):
+    """(overlaps, gaps) as layer ids. A plan must tile [0, n) exactly once; this proves it did."""
+    owner, dup = {}, []
+    for m, (a, b) in assignments.items():
+        for i in range(a, b):
+            if i in owner:
+                dup.append((i, owner[i], m))
+            owner[i] = m
+    return dup, [i for i in range(n_layers) if i not in owner]
+
+
 # --- node records ---------------------------------------------------------------------------------
 def _record(name, hdr):
     """A fresh node record. Everything the planner reads lives here, plus the socket and hub bookkeeping."""
-    return {"name": name, "ws": None, "device": hdr.get("device"), "ram_gb": hdr.get("ram_gb"),
+    return {"name": name, "ws": None, "device": hdr.get("device"),
+            "ram_gb": _capped_ram(name, hdr.get("device"), hdr.get("ram_gb")),
             "ms_per_layer": None, "battery": None, "thermal": None, "nsp_temp_c": None, "mem_pct": None, "mem_available_bytes": None,
             "mem": None, "rss_mb": None, "cache_reqs": None, "layers": None, "present": False, "ready": False,
             "ineligible": False, "ema_ms_per_layer": None, "ema_samples": 0, "ema_wire_ms": None, "ema_batch": {},
             "disk": set(), "reassign": False, "bw_bps": None, "load_s_per_layer": None, "ready_at": None,
+            # What one layer really costs this node's runtime, when it knows better than the shard
+            # size does. The NPU engine reports it because an fp16 graph plus its HTP context dwarfs
+            # the int4 shard the planner would otherwise size it by. None means "use layer_bytes".
+            "bytes_per_layer": None,
             "role": "joining", "batch": False, "train": False, "files": [], "fingerprints": {},
             "last_hb": time.time(), "hold": collections.deque(), "not_before": 0.0, "pending_gen": 0,
             "told": None, "move_to": None, "absent_since": None, "mem_penalty_suppressed": False}
@@ -248,6 +383,9 @@ def _on_ready(name, n, hdr):
     layers = [int(v) for v in hdr["layers"]]
     if hdr.get("load_s") is not None and layers[1] > layers[0]:
         n["load_s_per_layer"] = _ema(n["load_s_per_layer"], hdr["load_s"] / (layers[1] - layers[0]))
+    # Re-stated on every ready: the first one is an estimate from the graph files, later ones
+    # can be what the runtime actually turned out to cost.
+    _set_bytes_per_layer(n, hdr)
     if g is not None and g not in (n["pending_gen"], plan_state["gen"]):
         # an answer to an assign we have since superseded; the bench above is still real
         print(f"  {name}: ready for gen {g} (want {n['pending_gen']}), bench noted, otherwise ignored", flush=True)
@@ -334,7 +472,7 @@ def _left(name, ws, why):
         f = waiters.pop(k)
         if not f.done():
             f.set_exception(RuntimeError(f"node {name} left"))
-    schedule_replan("leave", placement.LEAVE_GRACE_S)
+    schedule_replan("leave", _replan_delay(placement.LEAVE_GRACE_S))
 
 
 # --- join -----------------------------------------------------------------------------------------
@@ -379,8 +517,12 @@ async def _hello(name, hdr, ws):
     # A new socket means the node holds nothing we can vouch for until its ready says so. Keeping the
     # old range here made the planner credit RAM the node no longer uses and cost its reload at zero.
     n.update(ws=ws, present=True, ready=False, role="joining", last_hb=time.time(), absent_since=None,
-             device=hdr.get("device", n["device"]), ram_gb=hdr.get("ram_gb", n["ram_gb"]),
+             device=hdr.get("device", n["device"]),
+             ram_gb=_capped_ram(name, hdr.get("device", n["device"]), hdr.get("ram_gb", n["ram_gb"])),
              reassign=bool(hdr.get("reassign")), layers=None, files=[], fingerprints={})
+    # First hello from an NPU node: it has measured nothing yet, so size it by the graph the hub
+    # serves rather than by the much smaller .npz the other runtimes read.
+    _set_bytes_per_layer(n, hdr)
     if "disk" in hdr:
         n["disk"] = {int(i) for i in hdr["disk"]}
     nodes[name] = n
@@ -402,7 +544,7 @@ async def _hello(name, hdr, ws):
         n.update(told=rng, pending_gen=plan_state["gen"], role="active" if rng == mine else n["role"])
         await _send(n, {"t": "assign", "layers": rng, "gen": plan_state["gen"]})
     emit({"t": "join", "node": name, "layers": rng, "reassign": n["reassign"]})
-    schedule_replan("join", placement.JOIN_DEBOUNCE_S)
+    schedule_replan("join", _replan_delay(placement.JOIN_DEBOUNCE_S))
     return n
 
 
@@ -460,6 +602,12 @@ def compute_plan(util=None, min_nodes=None, concurrency=None, force=False, provi
 
 
 _replan = {"task": None, "due": 0.0}
+
+
+def _replan_delay(default):
+    """--replan-delay overrides the join/leave debounce. The debounce is not the planner thinking;
+    it is the hub waiting to see whether more nodes are about to arrive."""
+    return default if ARGS.replan_delay is None else max(0.0, ARGS.replan_delay)
 
 
 def schedule_replan(trigger, delay):
@@ -574,6 +722,7 @@ async def apply_plan(plan) -> str:
     async with plan_lock:
         G = plan_state["gen"] + 1
         A = plan["assignments"]
+        before_apply = dict(plan_state["assignments"])   # for the changed-line below, before we mutate it
         changed = [m for m, rng in A.items()
                    if m in nodes and (plan_state["assignments"].get(m) != rng or nodes[m]["layers"] != rng)]
         # phase 1: prefetch while the old pipeline keeps serving
@@ -690,6 +839,15 @@ async def apply_plan(plan) -> str:
               "standby": plan_state["standby"], "reasons": plan["reasons"]})
         sb = "; standby " + ", ".join(f"{m} ({r})" for m, r in plan_state["standby"].items()) if plan_state["standby"] else ""
         print(f"  plan gen {G} applied: {_fmt(plan_state['assignments']) or 'nothing'}{sb}", flush=True)
+        # What actually changed, and proof the result tiles the model exactly once. Without this the
+        # applied line looks identical whether a node was left alone or swapped, and a transient
+        # double-owned layer would go unnoticed.
+        print(f"    changed: {_diff(before_apply, plan_state['assignments']) or 'nothing'}", flush=True)
+        dup, gaps = _coverage(plan_state["assignments"], cfg.n_layers)
+        if dup:
+            print(f"    WARNING overlap: " + ", ".join(f"layer {i} in both {x} and {y}" for i, x, y in dup), flush=True)
+        if gaps:
+            print(f"    unserved: {_ranges(gaps)}", flush=True)
         return outcome
 
 

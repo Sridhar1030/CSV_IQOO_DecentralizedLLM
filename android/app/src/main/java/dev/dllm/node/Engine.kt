@@ -31,6 +31,11 @@ interface Engine {
     /** File extension of the per-layer shards this engine downloads: "npz" for the Kotlin CPU
      *  engine, "tflite" for the NPU engine. The hub serves layer_XX.<ext> either way. */
     val shardExt: String get() = "npz"
+    /** What one layer really costs this runtime in bytes, when the engine knows better than the
+     *  shard size does, else null and the hub sizes us by the shard. The NPU engine reports it: its
+     *  graphs carry fp16 weights plus an HTP context, so a 14B layer costs about 2.4 GB against a
+     *  131 MB int4 shard, and a planner sizing by the shard would hand a phone far more than it holds. */
+    val bytesPerLayer: Long? get() = null
     fun load(dir: File, a: Int, b: Int, cfg: ModelConfig)
     /** x is n rows of cfg.hidden floats at absolute positions pos..pos+n-1. Returns the same shape. */
     fun forward(x: FloatArray, n: Int, pos: Int, req: String): FloatArray

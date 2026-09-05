@@ -1,5 +1,9 @@
 """Layer node. Holds layers [a, b) only. One persistent WebSocket to the hub. Never loads the full model.
-python -m dllm.node --hub ws://192.168.1.10:8000/ws/node --name mac2 --code ABC123 [--layers 16-28] [--device mps]"""
+python -m dllm.node --hub ws://192.168.1.10:8000/ws/node --name mac2 --code ABC123 [--layers 16-28] [--device mps|mlx]
+
+--device mlx runs the shard on dllm.mlx_backend (Apple's Metal via MLX) instead of torch. If MLX
+is not installed, or the shard fails to build or warm on it, the node prints why and falls back to
+the torch Shard on CPU automatically -- see build_shard() below. Never crashes the node either way."""
 import argparse, asyncio, hashlib, os, resource, subprocess, sys, time, traceback, urllib.request
 import numpy as np
 import torch, websockets
@@ -108,7 +112,45 @@ def fetch_shards(http_base, shard_dir, a, b):
     return total, time.time() - t0
 
 
-def load_range(http_base, shard_dir, a, b, device="cpu", shard=None):
+def build_shard(cfg, shard_dir, a, b, device, shard, memory_cap=None):
+    """Build or re-range the shard for [a, b) on `device`. Returns (shard, device_used).
+
+    When `device` is "mlx", MLX is tried first; if it is not importable, or fails to construct or
+    warm on the real weights in `shard_dir`, this prints one line saying why and falls back to the
+    torch Shard on CPU instead of raising. A Mac node asked for a Metal backend it does not
+    actually have must still come up and serve on CPU, not go missing. Any other `device` ("cpu",
+    "mps") is unaffected: same construction as before, errors still propagate."""
+    if device == "mlx":
+        try:
+            from dllm.mlx_backend import MlxShard, set_memory_cap, memory_now
+            if memory_cap:
+                # Before anything is allocated, so the first layer already loads under the ceiling.
+                set_memory_cap(memory_cap)
+            if isinstance(shard, MlxShard):
+                shard.reassign(shard_dir, a, b)
+            else:
+                shard = MlxShard(cfg, shard_dir, a, b)
+            # Prove it actually runs before committing to it: an import can succeed while the
+            # Metal device init or a real forward still fails.
+            shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_mlx_probe")
+            shard.reset("_mlx_probe")
+            if memory_cap:
+                act, peak = memory_now()
+                if act is not None:
+                    print(f"mlx holding {act/2**30:.2f} GB (peak {peak/2**30:.2f}) under a "
+                          f"{float(memory_cap):.1f} GB cap", flush=True)
+            return shard, "mlx"
+        except Exception as e:
+            print(f"--device mlx unavailable ({type(e).__name__}: {e}) -- falling back to torch on cpu", flush=True)
+            device, shard = "cpu", None   # an MlxShard (or nothing) can't be torch's reassign target
+    if isinstance(shard, Shard):
+        shard.reassign(shard_dir, a, b)
+    else:
+        shard = Shard(cfg, shard_dir, a, b, device=device)
+    return shard, device
+
+
+def load_range(http_base, shard_dir, a, b, device="cpu", shard=None, memory_cap=None):
     """Fetch what is missing, build or re-range the shard, warm it, bench it. One function for the
     first assign and for a reassign, so both paths measure and report exactly the same things.
     Shards stay on disk whichever range this node holds: an unused file costs nothing at runtime,
@@ -117,10 +159,7 @@ def load_range(http_base, shard_dir, a, b, device="cpu", shard=None):
     dl_bytes, dl_s = fetch_shards(http_base, shard_dir, a, b)
     cfg = Cfg.load(f"{shard_dir}/config.json")
     t0 = time.time()
-    if shard is None:
-        shard = Shard(cfg, shard_dir, a, b, device=device)
-    else:
-        shard.reassign(shard_dir, a, b)
+    shard, device = build_shard(cfg, shard_dir, a, b, device, shard, memory_cap)
     # warm up + bench: one 1-token forward through own layers
     shard(torch.zeros(1, 1, cfg.hidden), torch.tensor([0]), req="_bench"); shard.reset("_bench")
     load_s = time.time() - t0
@@ -130,7 +169,7 @@ def load_range(http_base, shard_dir, a, b, device="cpu", shard=None):
     fields = {"layers": [a, b], "ms_per_layer": ms_per_layer, "batch": True, "reassign": True,
               "rss_mb": rss_mb(), "shard_dir": os.path.abspath(shard_dir), "files": sorted(os.listdir(shard_dir)),
               "fingerprints": {i: fingerprint(shard_dir, i) for i in range(a, b)},
-              "download_bytes": dl_bytes, "download_s": dl_s, "load_s": load_s}
+              "download_bytes": dl_bytes, "download_s": dl_s, "load_s": load_s, "device": device}
     return shard, cfg, fields
 
 
@@ -146,8 +185,15 @@ async def run(args):
         t = asyncio.create_task(coro); tasks.add(t); t.add_done_callback(tasks.discard)
 
     async with websockets.connect(args.hub, max_size=None) as ws:
+        # --memory-cap is what the planner is told this node has. Reporting the cap rather than the
+        # machine's physical RAM is the whole mechanism: ram_layers() sizes a node from ram_gb, so
+        # capping it here is what stops layers arriving in the first place. Enforcing the ceiling on
+        # the MLX side as well only catches what slips past that.
+        ram_gb = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2 ** 30, 1)
+        if args.memory_cap:
+            ram_gb = round(min(ram_gb, float(args.memory_cap)), 1)
         hello = {"t": "hello", "name": args.name, "code": args.code, "device": args.device,
-                 "ram_gb": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30, 1),
+                 "ram_gb": ram_gb,
                  "reassign": True, "disk": disk_layers(args.shards)}
         if args.layers:
             hello["layers"] = [int(v) for v in args.layers.split("-")]
@@ -186,7 +232,7 @@ async def run(args):
                 prev, shard = shard, None          # forwards answer "not loaded" until the new range is up
                 args.layers = f"{a}-{b}"           # reclaim this exact range if the connection drops and we retry
                 try:
-                    shard, cfg, ready_fields = await asyncio.to_thread(load_range, http_base, args.shards, a, b, args.device, prev)
+                    shard, cfg, ready_fields = await asyncio.to_thread(load_range, http_base, args.shards, a, b, args.device, prev, args.memory_cap)
                 except Exception as e:
                     # Say so, or the hub sees a heartbeating node that never answers and waits out its deadline.
                     traceback.print_exc()
@@ -269,5 +315,11 @@ if __name__ == "__main__":
     p.add_argument("--code", default="")
     p.add_argument("--layers", default=None, help="a-b, half-open. Omit to let the hub assign.")
     p.add_argument("--shards", default="shards")
-    p.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
+    p.add_argument("--memory-cap", type=float, default=None, metavar="GB",
+                   help="ceiling on the memory this node uses. Two effects: the planner is told "
+                        "this instead of the machine's physical RAM, so it stops assigning layers "
+                        "at the cap, and on --device mlx it is enforced with MLX's own memory "
+                        "limit. Omit for no cap.")
+    p.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu",
+                   help="cpu, mps, or mlx (Metal via MLX; falls back to cpu automatically if unavailable)")
     asyncio.run(forever(p.parse_args()))

@@ -121,3 +121,29 @@ afterwards and keep `manifest.json`, which is all the verification needs.
 
 The coordinator stops being able to serve shards to a new node once its layer copies are gone.
 Re-running the slicer restores that ability.
+
+## Pre-seeding the Android app's shards (skip the download)
+
+This is separate from the Termux workflow above: it's for the native Android app
+(package `dev.dllm.node`, a debug build), which keeps its shards in its own
+private directory rather than a Termux home dir. On `assign` it downloads only
+the layer range the hub gives it, but it also skips any file already on disk
+with a non-zero length -- so pushing every layer ahead of time, for every range
+the hub could ever hand out, makes the join instant with no download at all.
+
+```bash
+npu/preseed_phone.sh                       # every attached phone, tflite (NPU) shards, from dist/
+npu/preseed_phone.sh -s <serial>           # just one phone (repeat -s for more than one)
+npu/preseed_phone.sh -k npz -d <shard_dir> # CPU-engine (.npz) shards from a different export
+```
+
+adb can't write into an app-private directory directly, so the script stages each
+file through `/data/local/tmp` and `run-as dev.dllm.node cp`, one file at a time,
+so it never needs more than one shard's worth of spare space on the phone. A file
+already present at the correct size is skipped, so re-running (after a partial
+push, or just to confirm) finishes in seconds and pushes nothing. It never
+deletes anything already in the shard directory, including shards of the other
+kind (`.npz` left alone when pre-seeding `.tflite`, and vice versa).
+
+Requires the app already installed as a debug build (`run-as` needs that) and
+`adb devices` showing the phone as `device`, not `unauthorized`.

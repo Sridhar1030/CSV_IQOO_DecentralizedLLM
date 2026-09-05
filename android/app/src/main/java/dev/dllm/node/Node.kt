@@ -59,6 +59,7 @@ class Node(
                     val hello = JSONObject().put("t", "hello").put("name", nodeName).put("code", code)
                         .put("device", "android-${engine.name}").put("ram_gb", stats.ramGb())
                         .put("reassign", true).put("disk", JSONArray(diskLayers()))
+                    engine.bytesPerLayer?.let { hello.put("bytes_per_layer", it) }
                     layers?.let { hello.put("layers", JSONArray(listOf(it[0], it[1]))) }
                     webSocket.send(Wire.pack(hello).toByteString())
                     // Heartbeat from the first moment: the hub may keep us waiting for a plan.
@@ -137,6 +138,8 @@ class Node(
                     .put("shard_dir", shardDir.absolutePath)
                     .put("files", JSONArray(shardDir.list()!!.sorted()))
                     .put("fingerprints", JSONObject(fps.mapKeys { it.key.toString() }))
+                // Now that the range is loaded the engine knows what a layer really costs it.
+                engine.bytesPerLayer?.let { ready.put("bytes_per_layer", it) }
                 cfg = c
                 lastReady = ready
                 ws.send(Wire.pack(ready).toByteString())

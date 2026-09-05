@@ -145,7 +145,11 @@ def ram_layers(rec, layer_bytes, util):
     """How many layers this node may hold under the cap. The static bound comes from ram_gb; the
     live bound from what the OS says is free right now, crediting back what the node's own
     loaded layers occupy, so a phone with a game open is never planned as if it were empty."""
-    per = layer_bytes * LAYER_OVERHEAD
+    # A node may know its own per-layer cost better than the shard size does. The Hexagon NPU
+    # engine is the case that forces this: its graphs carry fp16 weights and the HTP context on top,
+    # measured at ~2.4 GB for a 14B layer whose int4 shard is 131 MB, so planning it from the shard
+    # size alone would hand a phone twenty times what it can hold.
+    per = (rec.get("bytes_per_layer") or layer_bytes) * LAYER_OVERHEAD
     r = math.floor((util * (rec.get("ram_gb") or 0) * 2 ** 30 - RESERVE_BYTES) / per)
     avail = rec.get("mem_available_bytes")
     if avail is not None:
